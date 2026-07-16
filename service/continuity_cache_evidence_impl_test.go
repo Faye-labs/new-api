@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 
 	"github.com/gin-gonic/gin"
@@ -46,7 +47,9 @@ func TestCaptureContinuityCacheEvidenceStripsAndLogsValidEnvelope(t *testing.T) 
 	appendContinuityCacheEvidenceAdminInfo(c, &relaycommon.RelayInfo{
 		StartTime:         start,
 		FirstResponseTime: firstResponse,
-		UpstreamModelName: "claude-sonnet-resolved",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "claude-sonnet-resolved",
+		},
 	}, adminInfo)
 
 	require.Equal(t, 3, adminInfo["multi_key_index"])
@@ -105,7 +108,7 @@ func TestAppendContinuityCacheEvidenceAdminInfoUsesLogTimeWhenFirstResponseIsUna
 	appendContinuityCacheEvidenceAdminInfo(c, &relaycommon.RelayInfo{
 		StartTime:         start,
 		FirstResponseTime: start.Add(-time.Second),
-		UpstreamModelName: "",
+		ChannelMeta:       &relaycommon.ChannelMeta{},
 	}, adminInfo)
 	after := time.Now().UnixMilli()
 
@@ -164,4 +167,41 @@ func TestAppendContinuityCacheEvidenceAdminInfoLogsOpaqueStableUpstreamKeyFinger
 	require.NoError(t, err)
 	assert.NotContains(t, string(encodedAdminInfo), keyA)
 	assert.NotContains(t, string(encodedAdminInfo), keyB)
+}
+
+func TestGenerateTextOtherInfoAlwaysRecordsAuthoritativeMultiKeyMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	start := time.UnixMilli(1_720_000_000_000)
+
+	tests := []struct {
+		name          string
+		isMultiKey    bool
+		multiKeyIndex int
+	}{
+		{name: "single key ignores stale index", multiKeyIndex: 7},
+		{name: "multi key", isMultiKey: true, multiKeyIndex: 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newContinuityCacheEvidenceTestContext()
+			common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, tt.isMultiKey)
+			common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, tt.multiKeyIndex)
+
+			other := GenerateTextOtherInfo(c, &relaycommon.RelayInfo{
+				StartTime:         start,
+				FirstResponseTime: start.Add(time.Millisecond),
+				ChannelMeta:       &relaycommon.ChannelMeta{},
+			}, 1, 1, 1, 0, 0, 0, 1)
+
+			adminInfo, ok := other["admin_info"].(map[string]interface{})
+			require.True(t, ok)
+			assert.Equal(t, tt.isMultiKey, adminInfo["is_multi_key"])
+			if tt.isMultiKey {
+				assert.Equal(t, tt.multiKeyIndex, adminInfo["multi_key_index"])
+			} else {
+				assert.NotContains(t, adminInfo, "multi_key_index")
+			}
+		})
+	}
 }
