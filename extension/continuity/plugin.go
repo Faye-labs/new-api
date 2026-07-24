@@ -6,6 +6,7 @@ import (
 
 	"github.com/QuantumNous/new-api/extension"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 )
@@ -28,9 +29,13 @@ func (plugin) Mount(router *gin.Engine) {
 		internalRoute.PATCH("/users/:id/group", updateManagedUserGroupHandler)
 		internalRoute.POST("/token-groups/batch", updateManagedTokenGroupsHandler)
 		internalRoute.GET("/routing-groups", listRoutingGroupsHandler)
+		internalRoute.GET("/group-model-status", groupModelStatusHandler)
+		internalRoute.GET("/group-model-status/checks", groupModelStatusChecksHandler)
+		internalRoute.POST("/group-model-status/checks", startGroupModelStatusCheckHandler)
 	}
 }
 
 func init() {
 	extension.Register(plugin{})
+	service.RegisterSystemTaskHandler(continuityGroupModelProbeHandler{})
 }

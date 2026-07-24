@@ -25,13 +25,23 @@ an absent secret leaves the routes unmounted.
 
 The model adapter remains in `model/continuity_managed_groups.go` because it
 must use NewAPI's cross-database transaction and cache primitives. It is the
-only business adapter between the extension and NewAPI's private model layer.
+business adapter between the extension and NewAPI's private model layer.
+
+The only relay seam is `controller.ProbeChannel`. It reuses NewAPI's existing
+channel-test adaptor, model-mapping and response-validation path for one exact
+group/model/channel tuple, while deliberately skipping billing, consume-log
+creation, channel response-time mutation and automatic enable/disable logic.
+Keep that exported seam narrow when resolving upstream changes; the probe
+scheduler and status policy belong in `extension/continuity/`.
 
 ## Compatibility contract
 
 `GET /internal/continuity/capabilities` is the versioned compatibility gate.
 Protocol version `1` advertises:
 
+- `group_model_status.read`
+- `group_model_status.checks.read`
+- `group_model_status.checks.write`
 - `routing_groups.read`
 - `token_groups.batch_write`
 - `user_group.write`
@@ -41,6 +51,20 @@ Protocol version `1` advertises:
 
 The `@continuity/api` client verifies this response before its first operation
 and fails closed on a missing or incompatible extension.
+
+The status integration uses these secret-authenticated endpoints:
+
+- `GET /internal/continuity/group-model-status` returns the current exact
+  group/model matrix with passive and recent active evidence.
+- `GET /internal/continuity/group-model-status/checks` returns a sanitized view
+  of the active or latest check task.
+- `POST /internal/continuity/group-model-status/checks` enqueues a manual check
+  or returns the existing single-flight task.
+
+Active checks are scheduled every 20 minutes by default. Override the cadence
+with `CONTINUITY_GROUP_MODEL_PROBE_INTERVAL_MINUTES`, or disable scheduled
+checks with `CONTINUITY_GROUP_MODEL_PROBE_ENABLED=0`; manual checks remain
+available while the extension itself is enabled.
 
 `single_process_population_fence_v1` means the fork prevents a DB read started
 before a managed mutation from repopulating stale data in the same NewAPI
@@ -67,7 +91,7 @@ origin    https://github.com/Faye-labs/new-api.git
 After merging or rebasing a new upstream release, run:
 
 ```bash
-go test ./extension/... ./model ./router
+go test ./extension/... ./controller ./model ./router
 ```
 
 Then build the normal NewAPI artifact and probe the deployed capability

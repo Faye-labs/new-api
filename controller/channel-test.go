@@ -41,6 +41,26 @@ type testResult struct {
 	newAPIError *types.NewAPIError
 }
 
+type channelTestOptions struct {
+	group            string
+	recordConsumeLog bool
+}
+
+type ChannelProbeStatus string
+
+const (
+	ChannelProbeStatusSucceeded     ChannelProbeStatus = "succeeded"
+	ChannelProbeStatusFailed        ChannelProbeStatus = "failed"
+	ChannelProbeStatusUnsupported   ChannelProbeStatus = "unsupported"
+	ChannelProbeStatusIndeterminate ChannelProbeStatus = "indeterminate"
+	ChannelProbeStatusCancelled     ChannelProbeStatus = "cancelled"
+)
+
+type ChannelProbeResult struct {
+	Status    ChannelProbeStatus
+	LatencyMs int64
+}
+
 func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointType string) string {
 	normalized := strings.TrimSpace(endpointType)
 	if normalized != "" {
@@ -53,6 +73,156 @@ func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointTyp
 		return string(constant.EndpointTypeOpenAIResponse)
 	}
 	return normalized
+}
+
+func isUnsupportedChannelTestType(channelType int) bool {
+	unsupportedTestChannelTypes := []int{
+		constant.ChannelTypeMidjourney,
+		constant.ChannelTypeMidjourneyPlus,
+		constant.ChannelTypeSunoAPI,
+		constant.ChannelTypeKling,
+		constant.ChannelTypeJimeng,
+		constant.ChannelTypeDoubaoVideo,
+		constant.ChannelTypeVidu,
+	}
+	return lo.Contains(unsupportedTestChannelTypes, channelType)
+}
+
+func isKnownChatProbeModel(modelName string) bool {
+	if common.IsOpenAITextModel(modelName) {
+		return true
+	}
+	lowerModelName := strings.ToLower(modelName)
+	knownChatMarkers := []string{
+		"baichuan",
+		"claude",
+		"cohere",
+		"command-a",
+		"command-r",
+		"deepseek",
+		"doubao",
+		"ernie",
+		"gemini",
+		"glm-",
+		"grok",
+		"hunyuan",
+		"kimi",
+		"llama",
+		"minimax",
+		"mistral",
+		"mixtral",
+		"moonshot",
+		"nova-",
+		"phi-",
+		"qwen",
+		"sonar",
+		"yi-",
+	}
+	for _, marker := range knownChatMarkers {
+		if strings.Contains(lowerModelName, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveChannelProbeEndpoint(channel *model.Channel, modelName string) (string, bool) {
+	if channel == nil {
+		return "", false
+	}
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		return "", false
+	}
+	if isUnsupportedChannelTestType(channel.Type) {
+		return "", false
+	}
+	if channel.Type <= constant.ChannelTypeUnknown ||
+		channel.Type >= constant.ChannelTypeDummy {
+		return "", false
+	}
+	switch channel.Type {
+	case constant.ChannelTypeAdvancedCustom,
+		constant.ChannelTypeReplicate,
+		constant.ChannelTypeSora:
+		return "", false
+	}
+
+	if strings.HasSuffix(modelName, ratio_setting.CompactModelSuffix) {
+		return string(constant.EndpointTypeOpenAIResponseCompact), true
+	}
+	lowerModelName := strings.ToLower(modelName)
+	if channel.Type == constant.ChannelTypeCodex ||
+		strings.Contains(lowerModelName, "codex") ||
+		common.IsOpenAIResponseOnlyModel(modelName) {
+		return string(constant.EndpointTypeOpenAIResponse), true
+	}
+
+	// Ability rows do not identify a request path. These model families require
+	// endpoint-specific request bodies that the synthetic text probe cannot
+	// infer safely, so leave them unknown instead of reporting a false outage.
+	uncertainModelMarkers := []string{
+		"audio",
+		"dall-e",
+		"flux",
+		"gpt-image",
+		"image-generation",
+		"imagen",
+		"moderation",
+		"realtime",
+		"seedream",
+		"speech",
+		"sora",
+		"transcription",
+		"translation",
+		"tts",
+		"video",
+		"whisper",
+	}
+	if common.IsImageGenerationModel(modelName) {
+		return "", false
+	}
+	for _, marker := range uncertainModelMarkers {
+		if strings.Contains(lowerModelName, marker) {
+			return "", false
+		}
+	}
+
+	if strings.Contains(lowerModelName, "rerank") ||
+		channel.Type == constant.ChannelTypeJina {
+		return string(constant.EndpointTypeJinaRerank), true
+	}
+	if strings.Contains(lowerModelName, "embedding") ||
+		strings.Contains(lowerModelName, "embed") ||
+		strings.HasPrefix(lowerModelName, "m3e") ||
+		strings.Contains(lowerModelName, "bge-") ||
+		channel.Type == constant.ChannelTypeMokaAI {
+		return string(constant.EndpointTypeEmbeddings), true
+	}
+
+	if !isKnownChatProbeModel(modelName) {
+		return "", false
+	}
+
+	// Known text models on native channel adaptors expose the unified OpenAI
+	// chat endpoint. Advanced Custom is excluded above because its path/model
+	// routing is operator-defined and cannot be inferred here.
+	return string(constant.EndpointTypeOpenAI), true
+}
+
+func cloneChannelForProbe(channel *model.Channel) *model.Channel {
+	if channel == nil {
+		return nil
+	}
+	probeChannel := *channel
+	if probeChannel.ChannelInfo.IsMultiKey &&
+		probeChannel.ChannelInfo.MultiKeyMode == constant.MultiKeyModePolling {
+		// GetNextEnabledKey persists polling progress for polling-mode channels.
+		// A synthetic check must not consume a production routing turn, so use a
+		// non-mutating key selection mode on the isolated channel copy.
+		probeChannel.ChannelInfo.MultiKeyMode = constant.MultiKeyModeRandom
+	}
+	return &probeChannel
 }
 
 func resolveChannelTestUserID(c *gin.Context) (int, error) {
@@ -73,20 +243,17 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 }
 
 func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+	return testChannelWithOptions(ctx, channel, testUserID, testModel, endpointType, isStream, channelTestOptions{
+		recordConsumeLog: true,
+	})
+}
+
+func testChannelWithOptions(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, options channelTestOptions) testResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	tik := time.Now()
-	var unsupportedTestChannelTypes = []int{
-		constant.ChannelTypeMidjourney,
-		constant.ChannelTypeMidjourneyPlus,
-		constant.ChannelTypeSunoAPI,
-		constant.ChannelTypeKling,
-		constant.ChannelTypeJimeng,
-		constant.ChannelTypeDoubaoVideo,
-		constant.ChannelTypeVidu,
-	}
-	if lo.Contains(unsupportedTestChannelTypes, channel.Type) {
+	if isUnsupportedChannelTestType(channel.Type) {
 		channelTypeName := constant.GetChannelTypeName(channel.Type)
 		return testResult{
 			localErr: fmt.Errorf("%s channel test is not supported", channelTypeName),
@@ -171,6 +338,9 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	c.Set("channel", channel.Type)
 	c.Set("base_url", channel.GetBaseURL())
 	group, _ := model.GetUserGroup(testUserID, false)
+	if strings.TrimSpace(options.group) != "" {
+		group = strings.TrimSpace(options.group)
+	}
 	c.Set("group", group)
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, testModel)
@@ -247,12 +417,13 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	info.IsChannelTest = true
 	info.InitChannelMeta(c)
 
-	err = attachTestBillingRequestInput(info, request)
-	if err != nil {
-		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
+	if options.recordConsumeLog {
+		if err := attachTestBillingRequestInput(info, request); err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
+			}
 		}
 	}
 
@@ -291,14 +462,16 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//// 创建一个用于日志的 info 副本，移除 ApiKey
 	//logInfo := info
 	//logInfo.ApiKey = ""
-	common.SysLog(fmt.Sprintf("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
-
-	priceData, err := helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
-	if err != nil {
-		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest)),
+	var priceData types.PriceData
+	if options.recordConsumeLog {
+		common.SysLog(fmt.Sprintf("testing channel %d with model %s , info %+v ", channel.Id, testModel, info.ToString()))
+		priceData, err = helper.ModelPriceHelper(c, info, 0, request.GetTokenCountMeta())
+		if err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest)),
+			}
 		}
 	}
 
@@ -492,29 +665,89 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	}
 	info.SetEstimatePromptTokens(usage.PromptTokens)
 
-	quota, tieredResult := settleTestQuota(info, priceData, usage)
-	tok := time.Now()
-	milliseconds := tok.Sub(tik).Milliseconds()
-	consumedTime := float64(milliseconds) / 1000.0
-	other := buildTestLogOther(c, info, priceData, usage, tieredResult)
-	model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
-		ChannelId:        channel.Id,
-		PromptTokens:     usage.PromptTokens,
-		CompletionTokens: usage.CompletionTokens,
-		ModelName:        info.OriginModelName,
-		TokenName:        "模型测试",
-		Quota:            quota,
-		Content:          "模型测试",
-		UseTimeSeconds:   int(consumedTime),
-		IsStream:         info.IsStream,
-		Group:            info.UsingGroup,
-		Other:            other,
-	})
-	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	if options.recordConsumeLog {
+		quota, tieredResult := settleTestQuota(info, priceData, usage)
+		tok := time.Now()
+		milliseconds := tok.Sub(tik).Milliseconds()
+		consumedTime := float64(milliseconds) / 1000.0
+		other := buildTestLogOther(c, info, priceData, usage, tieredResult)
+		model.RecordConsumeLog(c, testUserID, model.RecordConsumeLogParams{
+			ChannelId:        channel.Id,
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			ModelName:        info.OriginModelName,
+			TokenName:        "模型测试",
+			Quota:            quota,
+			Content:          "模型测试",
+			UseTimeSeconds:   int(consumedTime),
+			IsStream:         info.IsStream,
+			Group:            info.UsingGroup,
+			Other:            other,
+		})
+		common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
+	}
 	return testResult{
 		context:     c,
 		localErr:    nil,
 		newAPIError: nil,
+	}
+}
+
+// ProbeChannel runs the existing channel-test adaptor path for one exact
+// group/model/channel tuple without billing, consume-log creation, response-time
+// mutation, or channel enable/disable side effects.
+func ProbeChannel(ctx context.Context, channel *model.Channel, modelName string, group string) ChannelProbeResult {
+	startedAt := time.Now()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if channel == nil || strings.TrimSpace(modelName) == "" || strings.TrimSpace(group) == "" {
+		return ChannelProbeResult{Status: ChannelProbeStatusUnsupported}
+	}
+	if ctx.Err() != nil {
+		return ChannelProbeResult{Status: ChannelProbeStatusCancelled}
+	}
+	endpointType, supported := resolveChannelProbeEndpoint(channel, modelName)
+	if !supported {
+		return ChannelProbeResult{Status: ChannelProbeStatusUnsupported}
+	}
+
+	testUserID, err := resolveChannelTestUserID(nil)
+	if err != nil {
+		return ChannelProbeResult{Status: ChannelProbeStatusIndeterminate}
+	}
+	result := testChannelWithOptions(
+		ctx,
+		cloneChannelForProbe(channel),
+		testUserID,
+		modelName,
+		endpointType,
+		shouldUseStreamForAutomaticChannelTest(channel),
+		channelTestOptions{
+			group:            group,
+			recordConsumeLog: false,
+		},
+	)
+	latencyMs := time.Since(startedAt).Milliseconds()
+	if ctx.Err() != nil {
+		return ChannelProbeResult{
+			Status:    ChannelProbeStatusCancelled,
+			LatencyMs: latencyMs,
+		}
+	}
+	if result.localErr != nil || result.newAPIError != nil {
+		status := ChannelProbeStatusFailed
+		if result.context == nil {
+			status = ChannelProbeStatusIndeterminate
+		}
+		return ChannelProbeResult{
+			Status:    status,
+			LatencyMs: latencyMs,
+		}
+	}
+	return ChannelProbeResult{
+		Status:    ChannelProbeStatusSucceeded,
+		LatencyMs: latencyMs,
 	}
 }
 

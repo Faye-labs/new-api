@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -36,6 +37,9 @@ func capabilitiesHandler(c *gin.Context) {
 			"group_key_max_bytes":   continuityManagedGroupMaxLength,
 			"token_group_batch_max": continuityManagedTokenBatchMax,
 			"capabilities": []string{
+				"group_model_status.checks.read",
+				"group_model_status.checks.write",
+				"group_model_status.read",
 				"routing_groups.read",
 				"token_groups.batch_write",
 				"user_group.write",
@@ -123,6 +127,67 @@ func listRoutingGroupsHandler(c *gin.Context) {
 		"data": gin.H{
 			"groups": groups,
 		},
+	})
+}
+
+func groupModelStatusHandler(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	snapshot, err := groupModelStatusSnapshot(time.Now())
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    snapshot,
+	})
+}
+
+func groupModelStatusChecksHandler(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	task, err := currentOrLatestContinuityGroupModelProbeTask()
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if task == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "",
+			"data":    nil,
+		})
+		return
+	}
+	view, err := buildContinuityGroupModelProbeTaskView(task)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    view,
+	})
+}
+
+func startGroupModelStatusCheckHandler(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	task, created, err := enqueueContinuityGroupModelProbe()
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	view, err := buildContinuityGroupModelProbeTaskView(task)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	view.Created = &created
+	c.JSON(http.StatusAccepted, gin.H{
+		"success": true,
+		"message": "",
+		"data":    view,
 	})
 }
 

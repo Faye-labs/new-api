@@ -44,6 +44,9 @@ func TestCapabilitiesExposeVersionedHostContract(t *testing.T) {
 	assert.Equal(t, 1, body.Data.ProtocolVersion)
 	assert.Equal(t, "single_process_population_fence_v1", body.Data.CacheCoherency)
 	assert.Equal(t, []string{
+		"group_model_status.checks.read",
+		"group_model_status.checks.write",
+		"group_model_status.read",
 		"routing_groups.read",
 		"token_groups.batch_write",
 		"user_group.write",

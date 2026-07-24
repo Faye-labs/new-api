@@ -48,7 +48,14 @@ func setupContinuityManagedGroupServiceTest(t *testing.T) *gorm.DB {
 			require.NoError(t, sqlDB.Close())
 		}
 	})
-	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}))
+	require.NoError(t, database.AutoMigrate(
+		&model.User{},
+		&model.Token{},
+		&model.Channel{},
+		&model.Ability{},
+		&model.SystemTask{},
+		&model.SystemTaskLock{},
+	))
 	return database
 }
 

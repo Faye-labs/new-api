@@ -1,0 +1,251 @@
+package continuity
+
+import (
+	"sort"
+	"time"
+
+	"github.com/QuantumNous/new-api/model"
+	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
+	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
+)
+
+const (
+	continuityGroupModelStatusSchemaVersion = 1
+	continuityPassiveEvidenceWindowHours    = 24
+
+	continuityModelStatusOperational = "operational"
+	continuityModelStatusDegraded    = "degraded"
+	continuityModelStatusUnavailable = "unavailable"
+	continuityModelStatusUnknown     = "unknown"
+
+	continuityStatusSourceNone           = "none"
+	continuityStatusSourcePassiveTraffic = "passive_traffic"
+	continuityStatusSourceActiveProbe    = "active_probe"
+)
+
+type continuityGroupModelStatusSnapshot struct {
+	SchemaVersion int                           `json:"schema_version"`
+	GeneratedAt   int64                         `json:"generated_at"`
+	Window        continuityStatusWindow        `json:"window"`
+	Groups        []continuityRoutingGroupState `json:"groups"`
+}
+
+type continuityStatusWindow struct {
+	StartAt int64 `json:"start_at"`
+	EndAt   int64 `json:"end_at"`
+}
+
+type continuityRoutingGroupState struct {
+	GroupKey string                        `json:"group_key"`
+	Status   string                        `json:"status"`
+	Models   []continuityRoutingModelState `json:"models"`
+}
+
+type continuityRoutingModelState struct {
+	ModelID              string                             `json:"model_id"`
+	EligibleChannelCount int                                `json:"eligible_channel_count"`
+	Status               string                             `json:"status"`
+	StatusSource         string                             `json:"status_source"`
+	LatencyMs            *int64                             `json:"latency_ms,omitempty"`
+	LastCheckedAt        *int64                             `json:"last_checked_at,omitempty"`
+	Evidence             continuityGroupModelStatusEvidence `json:"evidence"`
+}
+
+type continuityGroupModelStatusEvidence struct {
+	Passive     *continuityPassiveTrafficEvidence `json:"passive"`
+	ActiveProbe *continuityActiveProbeEvidence    `json:"active_probe"`
+}
+
+type continuityPassiveTrafficEvidence struct {
+	WindowStartAt    int64   `json:"window_start_at"`
+	WindowEndAt      int64   `json:"window_end_at"`
+	LatestBucketAt   int64   `json:"latest_bucket_at"`
+	SuccessRate      float64 `json:"success_rate"`
+	AverageLatencyMs int64   `json:"average_latency_ms"`
+}
+
+type continuityActiveProbeEvidence struct {
+	Status    string `json:"status"`
+	CheckedAt int64  `json:"checked_at"`
+	LatencyMs int64  `json:"latency_ms"`
+}
+
+func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot, error) {
+	now = now.UTC().Truncate(time.Second)
+	windowStart := now.Add(-continuityPassiveEvidenceWindowHours * time.Hour)
+	snapshot := continuityGroupModelStatusSnapshot{
+		SchemaVersion: continuityGroupModelStatusSchemaVersion,
+		GeneratedAt:   now.Unix(),
+		Window: continuityStatusWindow{
+			StartAt: windowStart.Unix(),
+			EndAt:   now.Unix(),
+		},
+		Groups: make([]continuityRoutingGroupState, 0),
+	}
+
+	var abilities []model.Ability
+	if err := model.DB.Where("enabled = ?", true).Find(&abilities).Error; err != nil {
+		return continuityGroupModelStatusSnapshot{}, err
+	}
+
+	groupModels := make(map[string]map[string]map[int]struct{})
+	modelNames := make(map[string]struct{})
+	for _, ability := range abilities {
+		if _, ok := groupModels[ability.Group]; !ok {
+			groupModels[ability.Group] = make(map[string]map[int]struct{})
+		}
+		if _, ok := groupModels[ability.Group][ability.Model]; !ok {
+			groupModels[ability.Group][ability.Model] = make(map[int]struct{})
+		}
+		groupModels[ability.Group][ability.Model][ability.ChannelId] = struct{}{}
+		modelNames[ability.Model] = struct{}{}
+	}
+
+	sortedModelNames := make([]string, 0, len(modelNames))
+	for modelName := range modelNames {
+		sortedModelNames = append(sortedModelNames, modelName)
+	}
+	sort.Strings(sortedModelNames)
+
+	passiveByPair := make(map[string]map[string]perfmetrics.GroupResult)
+	for _, modelName := range sortedModelNames {
+		result, err := perfmetrics.Query(perfmetrics.QueryParams{
+			Model: modelName,
+			Hours: continuityPassiveEvidenceWindowHours,
+		})
+		if err != nil {
+			return continuityGroupModelStatusSnapshot{}, err
+		}
+		for _, groupResult := range result.Groups {
+			if _, configured := groupModels[groupResult.Group][modelName]; !configured {
+				continue
+			}
+			if _, ok := passiveByPair[groupResult.Group]; !ok {
+				passiveByPair[groupResult.Group] = make(map[string]perfmetrics.GroupResult)
+			}
+			passiveByPair[groupResult.Group][modelName] = groupResult
+		}
+	}
+
+	activeByPair, err := latestContinuityGroupModelProbeEvidence(now)
+	if err != nil {
+		return continuityGroupModelStatusSnapshot{}, err
+	}
+
+	groupKeys := make([]string, 0, len(groupModels))
+	for groupKey := range groupModels {
+		groupKeys = append(groupKeys, groupKey)
+	}
+	sort.Strings(groupKeys)
+
+	for _, groupKey := range groupKeys {
+		modelIDs := make([]string, 0, len(groupModels[groupKey]))
+		for modelID := range groupModels[groupKey] {
+			modelIDs = append(modelIDs, modelID)
+		}
+		sort.Strings(modelIDs)
+
+		group := continuityRoutingGroupState{
+			GroupKey: groupKey,
+			Status:   continuityModelStatusUnknown,
+			Models:   make([]continuityRoutingModelState, 0, len(modelIDs)),
+		}
+		for _, modelID := range modelIDs {
+			state := continuityRoutingModelState{
+				ModelID:              modelID,
+				EligibleChannelCount: len(groupModels[groupKey][modelID]),
+				Status:               continuityModelStatusUnknown,
+				StatusSource:         continuityStatusSourceNone,
+				Evidence: continuityGroupModelStatusEvidence{
+					Passive:     nil,
+					ActiveProbe: nil,
+				},
+			}
+
+			passive, observed := passiveByPair[groupKey][modelID]
+			if observed && len(passive.Series) > 0 {
+				latestBucketAt := passive.Series[len(passive.Series)-1].Ts
+				successRate := passive.SuccessRate
+				latencyMs := passive.AvgLatencyMs
+
+				state.Status = continuityModelStatusDegraded
+				if successRate >= 100 {
+					state.Status = continuityModelStatusOperational
+				}
+				state.StatusSource = continuityStatusSourcePassiveTraffic
+				state.LatencyMs = &latencyMs
+				state.LastCheckedAt = &latestBucketAt
+				state.Evidence.Passive = &continuityPassiveTrafficEvidence{
+					WindowStartAt:    windowStart.Unix(),
+					WindowEndAt:      now.Unix(),
+					LatestBucketAt:   latestBucketAt,
+					SuccessRate:      successRate,
+					AverageLatencyMs: latencyMs,
+				}
+			}
+
+			active, activelyChecked := activeByPair[continuityGroupModelProbePairKey(groupKey, modelID)]
+			if activelyChecked {
+				state.Evidence.ActiveProbe = &continuityActiveProbeEvidence{
+					Status:    active.Status,
+					CheckedAt: active.CheckedAt,
+					LatencyMs: active.LatencyMs,
+				}
+				passiveMayBeNewer := false
+				if state.Evidence.Passive != nil {
+					// Perf metrics store only a bucket start, not the timestamp
+					// of the latest sample inside it. Conservatively keep the
+					// passive result whenever the probe happened before that
+					// bucket closed, because traffic may have arrived later in
+					// the same bucket.
+					passiveBucketEnd := state.Evidence.Passive.LatestBucketAt +
+						perf_metrics_setting.GetBucketSeconds()
+					passiveMayBeNewer = active.CheckedAt < passiveBucketEnd
+				}
+				if active.Status != continuityModelStatusUnknown && !passiveMayBeNewer {
+					state.Status = active.Status
+					state.StatusSource = continuityStatusSourceActiveProbe
+					state.LastCheckedAt = &active.CheckedAt
+					state.LatencyMs = nil
+					if active.LatencyMs > 0 {
+						state.LatencyMs = &active.LatencyMs
+					}
+				} else if active.Status == continuityModelStatusUnknown &&
+					state.StatusSource == continuityStatusSourceNone {
+					state.StatusSource = continuityStatusSourceActiveProbe
+					state.LastCheckedAt = &active.CheckedAt
+				}
+			}
+			group.Models = append(group.Models, state)
+		}
+		group.Status = continuityAggregateGroupStatus(group.Models)
+		snapshot.Groups = append(snapshot.Groups, group)
+	}
+
+	return snapshot, nil
+}
+
+func continuityAggregateGroupStatus(models []continuityRoutingModelState) string {
+	if len(models) == 0 {
+		return continuityModelStatusUnknown
+	}
+
+	statusCounts := make(map[string]int)
+	for _, modelState := range models {
+		statusCounts[modelState.Status]++
+	}
+	if statusCounts[continuityModelStatusUnavailable] == len(models) {
+		return continuityModelStatusUnavailable
+	}
+	if statusCounts[continuityModelStatusOperational] == len(models) {
+		return continuityModelStatusOperational
+	}
+	if statusCounts[continuityModelStatusUnknown] == len(models) {
+		return continuityModelStatusUnknown
+	}
+	if statusCounts[continuityModelStatusDegraded] > 0 ||
+		statusCounts[continuityModelStatusUnavailable] > 0 {
+		return continuityModelStatusDegraded
+	}
+	return continuityModelStatusUnknown
+}
