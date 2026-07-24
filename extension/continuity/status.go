@@ -12,6 +12,9 @@ import (
 const (
 	continuityGroupModelStatusSchemaVersion = 1
 	continuityPassiveEvidenceWindowHours    = 24
+	continuityStatusHistoryIntervalSeconds  = int64(20 * 60)
+	continuityStatusHistoryPointLimit       = 72
+	continuityStatusHistoryTaskLimit        = 2048
 
 	continuityModelStatusOperational = "operational"
 	continuityModelStatusDegraded    = "degraded"
@@ -48,7 +51,21 @@ type continuityRoutingModelState struct {
 	StatusSource         string                             `json:"status_source"`
 	LatencyMs            *int64                             `json:"latency_ms,omitempty"`
 	LastCheckedAt        *int64                             `json:"last_checked_at,omitempty"`
+	History              continuityGroupModelStatusHistory  `json:"history"`
 	Evidence             continuityGroupModelStatusEvidence `json:"evidence"`
+}
+
+type continuityGroupModelStatusHistory struct {
+	WindowStartAt   int64                                    `json:"window_start_at"`
+	WindowEndAt     int64                                    `json:"window_end_at"`
+	IntervalSeconds int64                                    `json:"interval_seconds"`
+	Points          []continuityGroupModelStatusHistoryPoint `json:"points"`
+}
+
+type continuityGroupModelStatusHistoryPoint struct {
+	CheckedAt int64  `json:"checked_at"`
+	Status    string `json:"status"`
+	LatencyMs *int64 `json:"latency_ms,omitempty"`
 }
 
 type continuityGroupModelStatusEvidence struct {
@@ -131,6 +148,11 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 	if err != nil {
 		return continuityGroupModelStatusSnapshot{}, err
 	}
+	historyByPair, historyWindowStart, historyWindowEnd, err :=
+		continuityGroupModelProbeHistory(now)
+	if err != nil {
+		return continuityGroupModelStatusSnapshot{}, err
+	}
 
 	groupKeys := make([]string, 0, len(groupModels))
 	for groupKey := range groupModels {
@@ -151,11 +173,26 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 			Models:   make([]continuityRoutingModelState, 0, len(modelIDs)),
 		}
 		for _, modelID := range modelIDs {
+			pairKey := continuityGroupModelProbePairKey(groupKey, modelID)
+			historyPoints := historyByPair[pairKey]
 			state := continuityRoutingModelState{
 				ModelID:              modelID,
 				EligibleChannelCount: len(groupModels[groupKey][modelID]),
 				Status:               continuityModelStatusUnknown,
 				StatusSource:         continuityStatusSourceNone,
+				History: continuityGroupModelStatusHistory{
+					WindowStartAt:   historyWindowStart,
+					WindowEndAt:     historyWindowEnd,
+					IntervalSeconds: continuityStatusHistoryIntervalSeconds,
+					Points: append(
+						make(
+							[]continuityGroupModelStatusHistoryPoint,
+							0,
+							len(historyPoints),
+						),
+						historyPoints...,
+					),
+				},
 				Evidence: continuityGroupModelStatusEvidence{
 					Passive:     nil,
 					ActiveProbe: nil,
@@ -184,7 +221,7 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 				}
 			}
 
-			active, activelyChecked := activeByPair[continuityGroupModelProbePairKey(groupKey, modelID)]
+			active, activelyChecked := activeByPair[pairKey]
 			if activelyChecked {
 				state.Evidence.ActiveProbe = &continuityActiveProbeEvidence{
 					Status:    active.Status,
@@ -223,6 +260,90 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 	}
 
 	return snapshot, nil
+}
+
+func continuityGroupModelProbeHistory(
+	now time.Time,
+) (map[string][]continuityGroupModelStatusHistoryPoint, int64, int64, error) {
+	windowEnd := now.UTC().Truncate(time.Second).Unix()
+	windowStart := windowEnd - int64(continuityStatusHistoryPointLimit)*continuityStatusHistoryIntervalSeconds
+
+	var tasks []model.SystemTask
+	if err := model.DB.
+		Select("id", "result").
+		Where("type = ? AND status = ?", continuityGroupModelProbeTaskType, model.SystemTaskStatusSucceeded).
+		Where("updated_at >= ?", windowStart).
+		Order("id DESC").
+		Limit(continuityStatusHistoryTaskLimit).
+		Find(&tasks).Error; err != nil {
+		return nil, 0, 0, err
+	}
+
+	bucketsByPair := make(map[string]map[int]continuityGroupModelStatusHistoryPoint)
+	for _, task := range tasks {
+		result, err := decodeContinuityGroupModelProbeResult(task.Result)
+		if err != nil {
+			// Historical observability is best-effort. A malformed older task
+			// must not suppress the current status snapshot or newer checks.
+			continue
+		}
+		if result.SchemaVersion != continuityGroupModelStatusSchemaVersion {
+			continue
+		}
+		for _, evidence := range result.Pairs {
+			if evidence.CheckedAt < windowStart || evidence.CheckedAt > windowEnd {
+				continue
+			}
+			switch evidence.Status {
+			case continuityModelStatusOperational,
+				continuityModelStatusDegraded,
+				continuityModelStatusUnavailable,
+				continuityModelStatusUnknown:
+			default:
+				continue
+			}
+
+			bucketIndex := int(
+				(evidence.CheckedAt - windowStart) / continuityStatusHistoryIntervalSeconds,
+			)
+			if bucketIndex >= continuityStatusHistoryPointLimit {
+				bucketIndex = continuityStatusHistoryPointLimit - 1
+			}
+			pairKey := continuityGroupModelProbePairKey(evidence.GroupKey, evidence.ModelID)
+			if _, ok := bucketsByPair[pairKey]; !ok {
+				bucketsByPair[pairKey] = make(map[int]continuityGroupModelStatusHistoryPoint)
+			}
+			current, exists := bucketsByPair[pairKey][bucketIndex]
+			if exists && current.CheckedAt >= evidence.CheckedAt {
+				continue
+			}
+			point := continuityGroupModelStatusHistoryPoint{
+				CheckedAt: evidence.CheckedAt,
+				Status:    evidence.Status,
+			}
+			if evidence.LatencyMs > 0 {
+				latencyMs := evidence.LatencyMs
+				point.LatencyMs = &latencyMs
+			}
+			bucketsByPair[pairKey][bucketIndex] = point
+		}
+	}
+
+	historyByPair := make(map[string][]continuityGroupModelStatusHistoryPoint, len(bucketsByPair))
+	for pairKey, buckets := range bucketsByPair {
+		bucketIndexes := make([]int, 0, len(buckets))
+		for bucketIndex := range buckets {
+			bucketIndexes = append(bucketIndexes, bucketIndex)
+		}
+		sort.Ints(bucketIndexes)
+		points := make([]continuityGroupModelStatusHistoryPoint, 0, len(bucketIndexes))
+		for _, bucketIndex := range bucketIndexes {
+			points = append(points, buckets[bucketIndex])
+		}
+		historyByPair[pairKey] = points
+	}
+
+	return historyByPair, windowStart, windowEnd, nil
 }
 
 func continuityAggregateGroupStatus(models []continuityRoutingModelState) string {

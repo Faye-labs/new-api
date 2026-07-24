@@ -135,6 +135,127 @@ func TestGroupModelStatusSnapshotReturnsExactConfiguredMatrixAndPassiveEvidence(
 	assert.Nil(t, beta.Models[0].Evidence.ActiveProbe)
 }
 
+func TestGroupModelStatusSnapshotReturnsBucketedProbeHistory(t *testing.T) {
+	database := setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, database.AutoMigrate(&model.PerfMetric{}))
+
+	now := time.Date(2030, time.January, 2, 0, 0, 0, 0, time.UTC)
+	windowStart := now.Add(-24 * time.Hour)
+	require.NoError(t, database.Create(&model.Ability{
+		Group:     "group-history",
+		Model:     "model-history",
+		ChannelId: 42,
+		Enabled:   true,
+	}).Error)
+
+	result := continuityGroupModelProbeResult{
+		SchemaVersion: continuityGroupModelStatusSchemaVersion,
+		CheckedAt:     now.Unix(),
+		Pairs: []continuityGroupModelProbeEvidence{
+			{
+				GroupKey:  "group-history",
+				ModelID:   "model-history",
+				Status:    continuityModelStatusOperational,
+				CheckedAt: windowStart.Add(time.Minute).Unix(),
+				LatencyMs: 300,
+			},
+			{
+				GroupKey:  "group-history",
+				ModelID:   "model-history",
+				Status:    continuityModelStatusDegraded,
+				CheckedAt: windowStart.Add(10 * time.Minute).Unix(),
+				LatencyMs: 450,
+			},
+			{
+				GroupKey:  "group-history",
+				ModelID:   "model-history",
+				Status:    continuityModelStatusUnavailable,
+				CheckedAt: now.Add(-time.Minute).Unix(),
+			},
+			{
+				GroupKey:  "group-history",
+				ModelID:   "model-history",
+				Status:    continuityModelStatusOperational,
+				CheckedAt: windowStart.Add(-time.Second).Unix(),
+				LatencyMs: 100,
+			},
+		},
+	}
+	resultJSON, err := common.Marshal(result)
+	require.NoError(t, err)
+	require.NoError(t, database.Create(&model.SystemTask{
+		TaskID:    "systask_status_history_corrupt_old",
+		Type:      continuityGroupModelProbeTaskType,
+		Status:    model.SystemTaskStatusSucceeded,
+		Result:    "{",
+		UpdatedAt: now.Add(-time.Hour).Unix(),
+	}).Error)
+	require.NoError(t, database.Create(&model.SystemTask{
+		TaskID:    "systask_status_history",
+		Type:      continuityGroupModelProbeTaskType,
+		Status:    model.SystemTaskStatusSucceeded,
+		Result:    string(resultJSON),
+		UpdatedAt: now.Unix(),
+	}).Error)
+
+	snapshot, err := groupModelStatusSnapshot(now)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Groups, 1)
+	require.Len(t, snapshot.Groups[0].Models, 1)
+	history := snapshot.Groups[0].Models[0].History
+	assert.Equal(t, windowStart.Unix(), history.WindowStartAt)
+	assert.Equal(t, now.Unix(), history.WindowEndAt)
+	assert.Equal(t, int64(20*60), history.IntervalSeconds)
+	require.Len(t, history.Points, 2)
+	assert.Equal(t, windowStart.Add(10*time.Minute).Unix(), history.Points[0].CheckedAt)
+	assert.Equal(t, continuityModelStatusDegraded, history.Points[0].Status)
+	require.NotNil(t, history.Points[0].LatencyMs)
+	assert.Equal(t, int64(450), *history.Points[0].LatencyMs)
+	assert.Equal(t, now.Add(-time.Minute).Unix(), history.Points[1].CheckedAt)
+	assert.Equal(t, continuityModelStatusUnavailable, history.Points[1].Status)
+	assert.Nil(t, history.Points[1].LatencyMs)
+}
+
+func TestGroupModelProbeHistoryKeepsAtMostSeventyTwoLatestBucketPoints(t *testing.T) {
+	database := setupContinuityManagedGroupServiceTest(t)
+	now := time.Date(2030, time.January, 2, 0, 0, 0, 0, time.UTC)
+
+	pairs := make([]continuityGroupModelProbeEvidence, 0, 73)
+	for index := 72; index >= 0; index-- {
+		pairs = append(pairs, continuityGroupModelProbeEvidence{
+			GroupKey:  "group-history",
+			ModelID:   "model-history",
+			Status:    continuityModelStatusOperational,
+			CheckedAt: now.Add(-time.Duration(index) * 20 * time.Minute).Unix(),
+			LatencyMs: int64(index + 1),
+		})
+	}
+	resultJSON, err := common.Marshal(continuityGroupModelProbeResult{
+		SchemaVersion: continuityGroupModelStatusSchemaVersion,
+		CheckedAt:     now.Unix(),
+		Pairs:         pairs,
+	})
+	require.NoError(t, err)
+	require.NoError(t, database.Create(&model.SystemTask{
+		TaskID:    "systask_status_history_limit",
+		Type:      continuityGroupModelProbeTaskType,
+		Status:    model.SystemTaskStatusSucceeded,
+		Result:    string(resultJSON),
+		UpdatedAt: now.Unix(),
+	}).Error)
+
+	historyByPair, windowStart, windowEnd, err := continuityGroupModelProbeHistory(now)
+	require.NoError(t, err)
+	assert.Equal(t, now.Add(-24*time.Hour).Unix(), windowStart)
+	assert.Equal(t, now.Unix(), windowEnd)
+	points := historyByPair[continuityGroupModelProbePairKey("group-history", "model-history")]
+	require.Len(t, points, continuityStatusHistoryPointLimit)
+	assert.Equal(t, now.Add(-24*time.Hour).Unix(), points[0].CheckedAt)
+	assert.Equal(t, now.Unix(), points[len(points)-1].CheckedAt)
+	require.NotNil(t, points[len(points)-1].LatencyMs)
+	assert.Equal(t, int64(1), *points[len(points)-1].LatencyMs)
+}
+
 func TestGroupModelStatusEndpointRequiresSecretAndReturnsVersionedEnvelope(t *testing.T) {
 	database := setupContinuityManagedGroupServiceTest(t)
 	require.NoError(t, database.AutoMigrate(&model.PerfMetric{}))
@@ -188,7 +309,13 @@ func TestGroupModelStatusEndpointRequiresSecretAndReturnsVersionedEnvelope(t *te
 					EligibleChannelCount int    `json:"eligible_channel_count"`
 					Status               string `json:"status"`
 					StatusSource         string `json:"status_source"`
-					Evidence             struct {
+					History              struct {
+						WindowStartAt   int64                                    `json:"window_start_at"`
+						WindowEndAt     int64                                    `json:"window_end_at"`
+						IntervalSeconds int64                                    `json:"interval_seconds"`
+						Points          []continuityGroupModelStatusHistoryPoint `json:"points"`
+					} `json:"history"`
+					Evidence struct {
 						Passive     any `json:"passive"`
 						ActiveProbe any `json:"active_probe"`
 					} `json:"evidence"`
@@ -209,6 +336,14 @@ func TestGroupModelStatusEndpointRequiresSecretAndReturnsVersionedEnvelope(t *te
 	assert.Equal(t, 1, response.Data.Groups[0].Models[0].EligibleChannelCount)
 	assert.Equal(t, continuityModelStatusUnknown, response.Data.Groups[0].Models[0].Status)
 	assert.Equal(t, continuityStatusSourceNone, response.Data.Groups[0].Models[0].StatusSource)
+	history := response.Data.Groups[0].Models[0].History
+	assert.Equal(
+		t,
+		int64(24*time.Hour/time.Second),
+		history.WindowEndAt-history.WindowStartAt,
+	)
+	assert.Equal(t, continuityStatusHistoryIntervalSeconds, history.IntervalSeconds)
+	assert.Empty(t, history.Points)
 	assert.Nil(t, response.Data.Groups[0].Models[0].Evidence.Passive)
 	assert.Nil(t, response.Data.Groups[0].Models[0].Evidence.ActiveProbe)
 }
