@@ -247,12 +247,16 @@ func GetTokenById(id int) (*Token, error) {
 		return nil, errors.New("id 为空！")
 	}
 	token := Token{Id: id}
+	cacheRevision := currentCachePopulationRevision()
 	var err error = nil
 	err = DB.First(&token, "id = ?", id).Error
 	if shouldUpdateRedis(true, err) {
 		gopool.Go(func() {
-			if err := cacheSetToken(token); err != nil {
-				common.SysLog("failed to update user status cache: " + err.Error())
+			_, cacheErr := populateCacheAtRevision(cacheRevision, func() error {
+				return cacheSetToken(token)
+			})
+			if cacheErr != nil {
+				common.SysLog("failed to update user status cache: " + cacheErr.Error())
 			}
 		})
 	}
@@ -260,12 +264,16 @@ func GetTokenById(id int) (*Token, error) {
 }
 
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
+	var cacheRevision uint64
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
 		if shouldUpdateRedis(fromDB, err) && token != nil {
 			gopool.Go(func() {
-				if err := cacheSetToken(*token); err != nil {
-					common.SysLog("failed to update user status cache: " + err.Error())
+				_, cacheErr := populateCacheAtRevision(cacheRevision, func() error {
+					return cacheSetToken(*token)
+				})
+				if cacheErr != nil {
+					common.SysLog("failed to update user status cache: " + cacheErr.Error())
 				}
 			})
 		}
@@ -279,6 +287,7 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// Don't return error - fall through to DB
 	}
 	fromDB = true
+	cacheRevision = currentCachePopulationRevision()
 	err = DB.Where(commonKeyCol+" = ?", key).First(&token).Error
 	return token, err
 }
@@ -291,12 +300,15 @@ func (token *Token) Insert() error {
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
+	cacheRevision := currentCachePopulationRevision()
 	defer func() {
 		if shouldUpdateRedis(true, err) {
 			gopool.Go(func() {
-				err := cacheSetToken(*token)
-				if err != nil {
-					common.SysLog("failed to update token cache: " + err.Error())
+				_, cacheErr := populateCacheAtRevision(cacheRevision, func() error {
+					return cacheSetToken(*token)
+				})
+				if cacheErr != nil {
+					common.SysLog("failed to update token cache: " + cacheErr.Error())
 				}
 			})
 		}
@@ -307,12 +319,15 @@ func (token *Token) Update() (err error) {
 }
 
 func (token *Token) SelectUpdate() (err error) {
+	cacheRevision := currentCachePopulationRevision()
 	defer func() {
 		if shouldUpdateRedis(true, err) {
 			gopool.Go(func() {
-				err := cacheSetToken(*token)
-				if err != nil {
-					common.SysLog("failed to update token cache: " + err.Error())
+				_, cacheErr := populateCacheAtRevision(cacheRevision, func() error {
+					return cacheSetToken(*token)
+				})
+				if cacheErr != nil {
+					common.SysLog("failed to update token cache: " + cacheErr.Error())
 				}
 			})
 		}

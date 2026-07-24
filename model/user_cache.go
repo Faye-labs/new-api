@@ -101,12 +101,16 @@ func updateUserCache(user User) error {
 func GetUserCache(userId int) (userCache *UserBase, err error) {
 	var user *User
 	var fromDB bool
+	var cacheRevision uint64
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
 		if shouldUpdateRedis(fromDB, err) && user != nil {
 			gopool.Go(func() {
-				if err := populateUserCache(*user); err != nil {
-					common.SysLog("failed to update user status cache: " + err.Error())
+				_, cacheErr := populateCacheAtRevision(cacheRevision, func() error {
+					return populateUserCache(*user)
+				})
+				if cacheErr != nil {
+					common.SysLog("failed to update user status cache: " + cacheErr.Error())
 				}
 			})
 		}
@@ -120,6 +124,7 @@ func GetUserCache(userId int) (userCache *UserBase, err error) {
 
 	// If Redis fails, get from DB
 	fromDB = true
+	cacheRevision = currentCachePopulationRevision()
 	user, err = GetUserById(userId, false)
 	if err != nil {
 		return nil, err // Return nil and error if DB lookup fails

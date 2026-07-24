@@ -948,12 +948,16 @@ func ValidateAccessToken(token string) (*User, error) {
 
 // GetUserQuota gets quota from Redis first, falls back to DB if needed
 func GetUserQuota(id int, fromDB bool) (quota int, err error) {
+	var cacheRevision uint64
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
 		if shouldUpdateRedis(fromDB, err) {
 			gopool.Go(func() {
-				if err := updateUserQuotaCache(id, quota); err != nil {
-					common.SysLog("failed to update user quota cache: " + err.Error())
+				_, cacheErr := populateCacheAtRevision(cacheRevision, func() error {
+					return updateUserQuotaCache(id, quota)
+				})
+				if cacheErr != nil {
+					common.SysLog("failed to update user quota cache: " + cacheErr.Error())
 				}
 			})
 		}
@@ -966,6 +970,7 @@ func GetUserQuota(id int, fromDB bool) (quota int, err error) {
 		// Don't return error - fall through to DB
 	}
 	fromDB = true
+	cacheRevision = currentCachePopulationRevision()
 	err = DB.Model(&User{}).Where("id = ?", id).Select("quota").Find(&quota).Error
 	if err != nil {
 		return 0, err
@@ -986,12 +991,16 @@ func GetUserEmail(id int) (email string, err error) {
 
 // GetUserGroup gets group from Redis first, falls back to DB if needed
 func GetUserGroup(id int, fromDB bool) (group string, err error) {
+	var cacheRevision uint64
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
 		if shouldUpdateRedis(fromDB, err) {
 			gopool.Go(func() {
-				if err := updateUserGroupCache(id, group); err != nil {
-					common.SysLog("failed to update user group cache: " + err.Error())
+				_, cacheErr := populateCacheAtRevision(cacheRevision, func() error {
+					return updateUserGroupCache(id, group)
+				})
+				if cacheErr != nil {
+					common.SysLog("failed to update user group cache: " + cacheErr.Error())
 				}
 			})
 		}
@@ -1004,6 +1013,7 @@ func GetUserGroup(id int, fromDB bool) (group string, err error) {
 		// Don't return error - fall through to DB
 	}
 	fromDB = true
+	cacheRevision = currentCachePopulationRevision()
 	err = DB.Model(&User{}).Where("id = ?", id).Select(commonGroupCol).Find(&group).Error
 	if err != nil {
 		return "", err
@@ -1015,12 +1025,16 @@ func GetUserGroup(id int, fromDB bool) (group string, err error) {
 // GetUserSetting gets setting from Redis first, falls back to DB if needed
 func GetUserSetting(id int, fromDB bool) (settingMap dto.UserSetting, err error) {
 	var setting string
+	var cacheRevision uint64
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
 		if shouldUpdateRedis(fromDB, err) {
 			gopool.Go(func() {
-				if err := updateUserSettingCache(id, setting); err != nil {
-					common.SysLog("failed to update user setting cache: " + err.Error())
+				_, cacheErr := populateCacheAtRevision(cacheRevision, func() error {
+					return updateUserSettingCache(id, setting)
+				})
+				if cacheErr != nil {
+					common.SysLog("failed to update user setting cache: " + cacheErr.Error())
 				}
 			})
 		}
@@ -1033,6 +1047,7 @@ func GetUserSetting(id int, fromDB bool) (settingMap dto.UserSetting, err error)
 		// Don't return error - fall through to DB
 	}
 	fromDB = true
+	cacheRevision = currentCachePopulationRevision()
 	// can be nil setting
 	var safeSetting sql.NullString
 	err = DB.Model(&User{}).Where("id = ?", id).Select("setting").Find(&safeSetting).Error
@@ -1191,12 +1206,16 @@ func updateUserRequestCount(id int, count int) {
 
 // GetUsernameById gets username from Redis first, falls back to DB if needed
 func GetUsernameById(id int, fromDB bool) (username string, err error) {
+	var cacheRevision uint64
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
 		if shouldUpdateRedis(fromDB, err) {
 			gopool.Go(func() {
-				if err := updateUserNameCache(id, username); err != nil {
-					common.SysLog("failed to update user name cache: " + err.Error())
+				_, cacheErr := populateCacheAtRevision(cacheRevision, func() error {
+					return updateUserNameCache(id, username)
+				})
+				if cacheErr != nil {
+					common.SysLog("failed to update user name cache: " + cacheErr.Error())
 				}
 			})
 		}
@@ -1209,6 +1228,7 @@ func GetUsernameById(id int, fromDB bool) (username string, err error) {
 		// Don't return error - fall through to DB
 	}
 	fromDB = true
+	cacheRevision = currentCachePopulationRevision()
 	err = DB.Model(&User{}).Where("id = ?", id).Select("username").Find(&username).Error
 	if err != nil {
 		return "", err
