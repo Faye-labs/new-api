@@ -27,6 +27,10 @@ type continuityManagedTokenGroupsRequest struct {
 	Updates []continuityManagedTokenGroupUpdateRequest `json:"updates"`
 }
 
+type continuityGroupModelProbeExclusionsRequest struct {
+	Pairs *[]continuityGroupModelProbeExclusion `json:"pairs"`
+}
+
 func capabilitiesHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -39,6 +43,8 @@ func capabilitiesHandler(c *gin.Context) {
 			"capabilities": []string{
 				"group_model_status.checks.read",
 				"group_model_status.checks.write",
+				"group_model_status.exclusions.read",
+				"group_model_status.exclusions.write",
 				"group_model_status.read",
 				"routing_groups.read",
 				"token_groups.batch_write",
@@ -188,6 +194,51 @@ func startGroupModelStatusCheckHandler(c *gin.Context) {
 		"success": true,
 		"message": "",
 		"data":    view,
+	})
+}
+
+func getGroupModelProbeExclusionsHandler(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	state, err := loadContinuityGroupModelProbeExclusionState()
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data": gin.H{
+			"schema_version": continuityGroupModelProbeExclusionsSchema,
+			"initialized":    state.Initialized,
+			"pairs":          state.Pairs,
+		},
+	})
+}
+
+func replaceGroupModelProbeExclusionsHandler(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	var request continuityGroupModelProbeExclusionsRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		writeInternalError(c, errInvalidRequest)
+		return
+	}
+	if request.Pairs == nil {
+		writeInternalError(c, errInvalidRequest)
+		return
+	}
+	pairs, err := replaceContinuityGroupModelProbeExclusions(*request.Pairs)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data": gin.H{
+			"schema_version": continuityGroupModelProbeExclusionsSchema,
+			"initialized":    true,
+			"pairs":          pairs,
+		},
 	})
 }
 

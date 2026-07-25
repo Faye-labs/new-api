@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -44,8 +45,84 @@ func createContinuityProbePair(
 	abilities []model.Ability,
 ) {
 	t.Helper()
+	state, err := loadContinuityGroupModelProbeExclusionState()
+	require.NoError(t, err)
+	if !state.Initialized {
+		_, err := replaceContinuityGroupModelProbeExclusions(
+			[]continuityGroupModelProbeExclusion{},
+		)
+		require.NoError(t, err)
+	}
 	require.NoError(t, model.DB.Create(&databaseChannels).Error)
 	require.NoError(t, model.DB.Create(&abilities).Error)
+}
+
+func TestContinuityGroupModelProbeMakesNoProviderCallsBeforeExclusionsInitialize(t *testing.T) {
+	tests := []struct {
+		name string
+		task *model.SystemTask
+	}{
+		{
+			name: "scheduled",
+			task: &model.SystemTask{
+				ID:      1,
+				Payload: `{}`,
+			},
+		},
+		{
+			name: "manual",
+			task: &model.SystemTask{
+				ID:      1,
+				Payload: `{"manual":true}`,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setupContinuityManagedGroupServiceTest(t)
+			require.NoError(t, model.DB.Create(&model.Channel{
+				Id:     1,
+				Name:   "provider",
+				Key:    "key-1",
+				Status: common.ChannelStatusEnabled,
+			}).Error)
+			require.NoError(t, model.DB.Create(&model.Ability{
+				Group:     "standard",
+				Model:     "model-a",
+				ChannelId: 1,
+				Enabled:   true,
+			}).Error)
+
+			probeCount := 0
+			installContinuityProbeTestDoubles(t,
+				func(
+					_ context.Context,
+					_ *model.Channel,
+					_ string,
+					_ string,
+				) controller.ChannelProbeResult {
+					probeCount++
+					return controller.ChannelProbeResult{
+						Status: controller.ChannelProbeStatusSucceeded,
+					}
+				},
+				func(_ context.Context, _ time.Duration) error {
+					return nil
+				},
+			)
+
+			result, err := runContinuityGroupModelProbe(
+				context.Background(),
+				test.task,
+				nil,
+			)
+			require.NoError(t, err)
+			assert.Zero(t, probeCount)
+			assert.Empty(t, result.Pairs)
+			assert.Equal(t, continuityGroupModelProbeSummary{}, result.Summary)
+		})
+	}
 }
 
 func TestContinuityGroupModelProbeStopsAtFirstSuccessAndMarksFallbackDegraded(t *testing.T) {
@@ -95,6 +172,154 @@ func TestContinuityGroupModelProbeStopsAtFirstSuccessAndMarksFallbackDegraded(t 
 		Total:    1,
 		Degraded: 1,
 	}, result.Summary)
+}
+
+func TestContinuityGroupModelProbeSkipsPersistedCompatibilityPairs(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"standard":1}`))
+	createContinuityProbePair(t,
+		[]model.Channel{{
+			Id:     1,
+			Name:   "shared",
+			Key:    "key-1",
+			Status: common.ChannelStatusEnabled,
+		}},
+		[]model.Ability{
+			{Group: "standard", Model: "compat-model", ChannelId: 1, Enabled: true},
+			{Group: "standard", Model: "public-model", ChannelId: 1, Enabled: true},
+		},
+	)
+	_, err := replaceContinuityGroupModelProbeExclusions(
+		[]continuityGroupModelProbeExclusion{{
+			GroupKey: "standard",
+			ModelID:  "compat-model",
+		}},
+	)
+	require.NoError(t, err)
+
+	var probedModels []string
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, modelID string, _ string) controller.ChannelProbeResult {
+			probedModels = append(probedModels, modelID)
+			return controller.ChannelProbeResult{
+				Status: controller.ChannelProbeStatusSucceeded,
+			}
+		},
+		func(_ context.Context, _ time.Duration) error {
+			return nil
+		},
+	)
+
+	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"public-model"}, probedModels)
+	require.Len(t, result.Pairs, 1)
+	assert.Equal(t, "public-model", result.Pairs[0].ModelID)
+}
+
+func TestContinuityGroupModelProbeExclusionsMatchExactGroupModelPair(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(
+		`{"direct":1,"standard":1}`,
+	))
+	createContinuityProbePair(t,
+		[]model.Channel{
+			{
+				Id:     1,
+				Name:   "direct",
+				Key:    "key-1",
+				Status: common.ChannelStatusEnabled,
+			},
+			{
+				Id:     2,
+				Name:   "standard",
+				Key:    "key-2",
+				Status: common.ChannelStatusEnabled,
+			},
+		},
+		[]model.Ability{
+			{Group: "direct", Model: "shared-model", ChannelId: 1, Enabled: true},
+			{Group: "standard", Model: "shared-model", ChannelId: 2, Enabled: true},
+		},
+	)
+	_, err := replaceContinuityGroupModelProbeExclusions(
+		[]continuityGroupModelProbeExclusion{{
+			GroupKey: "standard",
+			ModelID:  "shared-model",
+		}},
+	)
+	require.NoError(t, err)
+
+	var probedGroups []string
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, _ string, groupKey string) controller.ChannelProbeResult {
+			probedGroups = append(probedGroups, groupKey)
+			return controller.ChannelProbeResult{
+				Status: controller.ChannelProbeStatusSucceeded,
+			}
+		},
+		func(_ context.Context, _ time.Duration) error {
+			return nil
+		},
+	)
+
+	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"direct"}, probedGroups)
+	require.Len(t, result.Pairs, 1)
+	assert.Equal(t, "direct", result.Pairs[0].GroupKey)
+	assert.Equal(t, "shared-model", result.Pairs[0].ModelID)
+}
+
+func TestContinuityGroupModelProbeRechecksExclusionsBeforeEveryChannelAttempt(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"standard":1}`))
+	createContinuityProbePair(t,
+		[]model.Channel{
+			{
+				Id:     1,
+				Name:   "first",
+				Key:    "key-1",
+				Status: common.ChannelStatusEnabled,
+			},
+			{
+				Id:     2,
+				Name:   "second",
+				Key:    "key-2",
+				Status: common.ChannelStatusEnabled,
+			},
+		},
+		[]model.Ability{
+			{Group: "standard", Model: "compat-model", ChannelId: 1, Enabled: true},
+			{Group: "standard", Model: "compat-model", ChannelId: 2, Enabled: true},
+		},
+	)
+
+	probeCount := 0
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, _ string, _ string) controller.ChannelProbeResult {
+			probeCount++
+			_, err := replaceContinuityGroupModelProbeExclusions(
+				[]continuityGroupModelProbeExclusion{{
+					GroupKey: "standard",
+					ModelID:  "compat-model",
+				}},
+			)
+			require.NoError(t, err)
+			return controller.ChannelProbeResult{
+				Status: controller.ChannelProbeStatusFailed,
+			}
+		},
+		func(_ context.Context, _ time.Duration) error {
+			return nil
+		},
+	)
+
+	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, probeCount)
+	assert.Empty(t, result.Pairs)
+	assert.Equal(t, continuityGroupModelProbeSummary{}, result.Summary)
 }
 
 func TestContinuityGroupModelProbeRotatesTopPriorityFirstChoiceAcrossRuns(t *testing.T) {

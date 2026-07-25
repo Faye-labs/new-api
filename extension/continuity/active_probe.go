@@ -181,9 +181,19 @@ func runContinuityGroupModelProbe(
 		pair.candidates = orderedCandidates
 		pair.nextRotation = nextRotation
 
-		round := probeContinuityGroupModelPair(ctx, *pair)
+		round, excluded, err := probeContinuityGroupModelPair(ctx, *pair)
+		if err != nil {
+			return continuityGroupModelProbeResult{}, err
+		}
 		if err := ctx.Err(); err != nil {
 			return continuityGroupModelProbeResult{}, err
+		}
+		if excluded {
+			processed++
+			if report != nil {
+				report(processed, total)
+			}
+			continue
 		}
 		if round.needsConfirm {
 			needsConfirmation = append(needsConfirmation, *pair)
@@ -212,9 +222,19 @@ func runContinuityGroupModelProbe(
 		if err := ctx.Err(); err != nil {
 			return continuityGroupModelProbeResult{}, err
 		}
-		round := probeContinuityGroupModelPair(ctx, pair)
+		round, excluded, err := probeContinuityGroupModelPair(ctx, pair)
+		if err != nil {
+			return continuityGroupModelProbeResult{}, err
+		}
 		if err := ctx.Err(); err != nil {
 			return continuityGroupModelProbeResult{}, err
+		}
+		if excluded {
+			processed++
+			if report != nil {
+				report(processed, total)
+			}
+			continue
 		}
 		if round.needsConfirm {
 			round.status = continuityModelStatusUnavailable
@@ -269,6 +289,15 @@ func runContinuityGroupModelProbe(
 }
 
 func loadContinuityGroupModelProbePairs() ([]continuityGroupModelProbePair, error) {
+	exclusionState, err := loadContinuityGroupModelProbeExclusionState()
+	if err != nil {
+		return nil, err
+	}
+	if !exclusionState.Initialized {
+		return []continuityGroupModelProbePair{}, nil
+	}
+	excludedPairs := continuityGroupModelProbeExclusionSet(exclusionState.Pairs)
+
 	var abilities []model.Ability
 	if err := model.DB.Where("enabled = ?", true).Find(&abilities).Error; err != nil {
 		return nil, err
@@ -299,6 +328,9 @@ func loadContinuityGroupModelProbePairs() ([]continuityGroupModelProbePair, erro
 	pairsByKey := make(map[string]*continuityGroupModelProbePair)
 	for _, ability := range abilities {
 		pairKey := continuityGroupModelProbePairKey(ability.Group, ability.Model)
+		if _, excluded := excludedPairs[pairKey]; excluded {
+			continue
+		}
 		pair, ok := pairsByKey[pairKey]
 		if !ok {
 			pair = &continuityGroupModelProbePair{
@@ -369,10 +401,20 @@ func rotateContinuityGroupModelProbeCandidates(
 func probeContinuityGroupModelPair(
 	ctx context.Context,
 	pair continuityGroupModelProbePair,
-) continuityGroupModelProbeRoundResult {
+) (continuityGroupModelProbeRoundResult, bool, error) {
 	failed := 0
 	uncertain := 0
 	for _, candidate := range pair.candidates {
+		excluded, err := isContinuityGroupModelProbePairExcluded(
+			pair.groupKey,
+			pair.modelID,
+		)
+		if err != nil {
+			return continuityGroupModelProbeRoundResult{}, false, err
+		}
+		if excluded {
+			return continuityGroupModelProbeRoundResult{}, true, nil
+		}
 		attemptContext, cancelAttempt := context.WithTimeout(
 			ctx,
 			continuityGroupModelProbeAttemptTimeout,
@@ -395,7 +437,7 @@ func probeContinuityGroupModelPair(
 				status:    status,
 				latencyMs: result.LatencyMs,
 				checkedAt: checkedAt,
-			}
+			}, false, nil
 		case controller.ChannelProbeStatusFailed:
 			failed++
 		case controller.ChannelProbeStatusCancelled:
@@ -406,7 +448,7 @@ func probeContinuityGroupModelPair(
 			return continuityGroupModelProbeRoundResult{
 				status:    continuityModelStatusUnknown,
 				checkedAt: checkedAt,
-			}
+			}, false, nil
 		case controller.ChannelProbeStatusUnsupported,
 			controller.ChannelProbeStatusIndeterminate:
 			uncertain++
@@ -419,13 +461,26 @@ func probeContinuityGroupModelPair(
 		return continuityGroupModelProbeRoundResult{
 			status:    continuityModelStatusUnknown,
 			checkedAt: checkedAt,
-		}
+		}, false, nil
 	}
 	return continuityGroupModelProbeRoundResult{
 		status:       continuityModelStatusUnknown,
 		checkedAt:    checkedAt,
 		needsConfirm: true,
+	}, false, nil
+}
+
+func isContinuityGroupModelProbePairExcluded(groupKey string, modelID string) (bool, error) {
+	exclusionState, err := loadContinuityGroupModelProbeExclusionState()
+	if err != nil {
+		return false, err
 	}
+	if !exclusionState.Initialized {
+		return true, nil
+	}
+	pairKey := continuityGroupModelProbePairKey(groupKey, modelID)
+	_, excluded := continuityGroupModelProbeExclusionSet(exclusionState.Pairs)[pairKey]
+	return excluded, nil
 }
 
 func waitForContinuityProbeConfirmation(ctx context.Context, delay time.Duration) error {

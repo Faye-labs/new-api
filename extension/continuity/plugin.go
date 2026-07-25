@@ -32,6 +32,8 @@ func (plugin) Mount(router *gin.Engine) {
 		internalRoute.GET("/group-model-status", groupModelStatusHandler)
 		internalRoute.GET("/group-model-status/checks", groupModelStatusChecksHandler)
 		internalRoute.POST("/group-model-status/checks", startGroupModelStatusCheckHandler)
+		internalRoute.GET("/group-model-status/exclusions", getGroupModelProbeExclusionsHandler)
+		internalRoute.PUT("/group-model-status/exclusions", replaceGroupModelProbeExclusionsHandler)
 	}
 }
 

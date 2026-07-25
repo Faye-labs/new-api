@@ -100,6 +100,12 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 		Groups: make([]continuityRoutingGroupState, 0),
 	}
 
+	exclusions, err := loadContinuityGroupModelProbeExclusions()
+	if err != nil {
+		return continuityGroupModelStatusSnapshot{}, err
+	}
+	excludedPairs := continuityGroupModelProbeExclusionSet(exclusions)
+
 	var abilities []model.Ability
 	if err := model.DB.Where("enabled = ?", true).Find(&abilities).Error; err != nil {
 		return continuityGroupModelStatusSnapshot{}, err
@@ -108,6 +114,10 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 	groupModels := make(map[string]map[string]map[int]struct{})
 	modelNames := make(map[string]struct{})
 	for _, ability := range abilities {
+		pairKey := continuityGroupModelProbePairKey(ability.Group, ability.Model)
+		if _, excluded := excludedPairs[pairKey]; excluded {
+			continue
+		}
 		if _, ok := groupModels[ability.Group]; !ok {
 			groupModels[ability.Group] = make(map[string]map[int]struct{})
 		}

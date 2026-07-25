@@ -42,6 +42,8 @@ Protocol version `1` advertises:
 - `group_model_status.read`
 - `group_model_status.checks.read`
 - `group_model_status.checks.write`
+- `group_model_status.exclusions.read`
+- `group_model_status.exclusions.write`
 - `routing_groups.read`
 - `token_groups.batch_write`
 - `user_group.write`
@@ -60,6 +62,23 @@ The status integration uses these secret-authenticated endpoints:
   of the active or latest check task.
 - `POST /internal/continuity/group-model-status/checks` enqueues a manual check
   or returns the existing single-flight task.
+- `GET /internal/continuity/group-model-status/exclusions` returns the persisted
+  exact group/model pairs omitted from active checks and status snapshots,
+  together with an `initialized` readiness flag.
+- `PUT /internal/continuity/group-model-status/exclusions` atomically replaces
+  that list. The request must contain a non-null `pairs` array; use an explicit
+  empty array to initialize checks with no exclusions.
+
+Each exclusion is scoped to one exact group/model pair. An identical model ID
+in another group remains visible and probeable. Stored exclusions remain
+readable after a routing group is removed so routine group lifecycle changes
+cannot break status or scheduled checks. A replacement may preserve such an
+exact stale pair while changing other groups, but cannot introduce a new pair
+for an unknown group. A running check re-reads exclusions before every channel
+attempt, so a newly excluded pair is not tried on a later fallback channel.
+Until the option has been explicitly initialized by a PUT, scheduled and manual
+checks complete with zero pairs and make no provider calls. The status snapshot
+remains available for passive traffic projection during that readiness state.
 
 Active checks are scheduled every 20 minutes by default. Override the cadence
 with `CONTINUITY_GROUP_MODEL_PROBE_INTERVAL_MINUTES`, or disable scheduled

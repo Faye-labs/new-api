@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -133,6 +134,88 @@ func TestGroupModelStatusSnapshotReturnsExactConfiguredMatrixAndPassiveEvidence(
 	assert.Nil(t, beta.Models[0].LastCheckedAt)
 	assert.Nil(t, beta.Models[0].Evidence.Passive)
 	assert.Nil(t, beta.Models[0].Evidence.ActiveProbe)
+}
+
+func TestGroupModelStatusSnapshotOmitsOnlyTheExactExcludedPairAndItsEvidence(t *testing.T) {
+	database := setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, database.AutoMigrate(&model.PerfMetric{}))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(
+		`{"direct":1,"standard":1}`,
+	))
+	now := time.Now().UTC().Truncate(time.Second)
+	recentBucket := now.Add(-time.Hour).Truncate(time.Hour).Unix()
+	require.NoError(t, database.Create(&[]model.Ability{
+		{Group: "direct", Model: "shared-model", ChannelId: 1, Enabled: true},
+		{Group: "standard", Model: "shared-model", ChannelId: 2, Enabled: true},
+	}).Error)
+	require.NoError(t, database.Create(&[]model.PerfMetric{
+		{
+			ModelName:      "shared-model",
+			Group:          "direct",
+			BucketTs:       recentBucket,
+			RequestCount:   4,
+			SuccessCount:   4,
+			TotalLatencyMs: 400,
+		},
+		{
+			ModelName:      "shared-model",
+			Group:          "standard",
+			BucketTs:       recentBucket,
+			RequestCount:   4,
+			SuccessCount:   0,
+			TotalLatencyMs: 4000,
+		},
+	}).Error)
+	_, err := replaceContinuityGroupModelProbeExclusions(
+		[]continuityGroupModelProbeExclusion{{
+			GroupKey: "standard",
+			ModelID:  "shared-model",
+		}},
+	)
+	require.NoError(t, err)
+	resultJSON, err := common.Marshal(continuityGroupModelProbeResult{
+		SchemaVersion: continuityGroupModelStatusSchemaVersion,
+		CheckedAt:     now.Unix(),
+		Pairs: []continuityGroupModelProbeEvidence{
+			{
+				GroupKey:  "direct",
+				ModelID:   "shared-model",
+				Status:    continuityModelStatusOperational,
+				CheckedAt: now.Unix(),
+				LatencyMs: 125,
+			},
+			{
+				GroupKey:  "standard",
+				ModelID:   "shared-model",
+				Status:    continuityModelStatusUnavailable,
+				CheckedAt: now.Unix(),
+				LatencyMs: 9000,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, database.Create(&model.SystemTask{
+		TaskID:    "systask_status_excluded_evidence",
+		Type:      continuityGroupModelProbeTaskType,
+		Status:    model.SystemTaskStatusSucceeded,
+		Result:    string(resultJSON),
+		UpdatedAt: now.Unix(),
+	}).Error)
+
+	snapshot, err := groupModelStatusSnapshot(now)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Groups, 1)
+	assert.Equal(t, "direct", snapshot.Groups[0].GroupKey)
+	require.Len(t, snapshot.Groups[0].Models, 1)
+	visible := snapshot.Groups[0].Models[0]
+	assert.Equal(t, "shared-model", visible.ModelID)
+	assert.Equal(t, continuityStatusSourceActiveProbe, visible.StatusSource)
+	require.NotNil(t, visible.Evidence.Passive)
+	assert.Equal(t, float64(100), visible.Evidence.Passive.SuccessRate)
+	require.NotNil(t, visible.Evidence.ActiveProbe)
+	assert.Equal(t, int64(125), visible.Evidence.ActiveProbe.LatencyMs)
+	require.Len(t, visible.History.Points, 1)
+	assert.Equal(t, continuityModelStatusOperational, visible.History.Points[0].Status)
 }
 
 func TestGroupModelStatusSnapshotReturnsBucketedProbeHistory(t *testing.T) {

@@ -26,6 +26,10 @@ func setupContinuityManagedGroupServiceTest(t *testing.T) *gorm.DB {
 	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
 	originalUserUsableGroups := setting.UserUsableGroups2JSONString()
 	originalSpecialUsableGroups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup.ReadAll()
+	common.OptionMapRWMutex.Lock()
+	originalOptionMap := common.OptionMap
+	common.OptionMap = make(map[string]string)
+	common.OptionMapRWMutex.Unlock()
 
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, originalLogDatabaseType)
 	common.RedisEnabled = false
@@ -43,6 +47,9 @@ func setupContinuityManagedGroupServiceTest(t *testing.T) *gorm.DB {
 		specialGroups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
 		specialGroups.Clear()
 		specialGroups.AddAll(originalSpecialUsableGroups)
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = originalOptionMap
+		common.OptionMapRWMutex.Unlock()
 		sqlDB, dbErr := database.DB()
 		if dbErr == nil {
 			require.NoError(t, sqlDB.Close())
@@ -53,10 +60,124 @@ func setupContinuityManagedGroupServiceTest(t *testing.T) *gorm.DB {
 		&model.Token{},
 		&model.Channel{},
 		&model.Ability{},
+		&model.Option{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
 	))
 	return database
+}
+
+func TestContinuityGroupModelProbeExclusionsPersistAsExactSortedPairs(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(
+		`{"direct":1,"standard":0.24}`,
+	))
+
+	saved, err := replaceContinuityGroupModelProbeExclusions(
+		[]continuityGroupModelProbeExclusion{
+			{GroupKey: "standard", ModelID: "model-z"},
+			{GroupKey: "direct", ModelID: "model-a"},
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, []continuityGroupModelProbeExclusion{
+		{GroupKey: "direct", ModelID: "model-a"},
+		{GroupKey: "standard", ModelID: "model-z"},
+	}, saved)
+
+	loaded, err := loadContinuityGroupModelProbeExclusions()
+	require.NoError(t, err)
+	assert.Equal(t, saved, loaded)
+}
+
+func TestContinuityGroupModelProbeExclusionsRemainReadableAfterGroupRemoval(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"standard":1}`))
+
+	saved, err := replaceContinuityGroupModelProbeExclusions(
+		[]continuityGroupModelProbeExclusion{{
+			GroupKey: "standard",
+			ModelID:  "compat-model",
+		}},
+	)
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"direct":1}`))
+
+	loaded, err := loadContinuityGroupModelProbeExclusions()
+	require.NoError(t, err)
+	assert.Equal(t, saved, loaded)
+}
+
+func TestContinuityGroupModelProbeExclusionsCanPreserveButNotIntroduceStalePairs(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(
+		`{"direct":1,"standard":1}`,
+	))
+	_, err := replaceContinuityGroupModelProbeExclusions(
+		[]continuityGroupModelProbeExclusion{
+			{GroupKey: "direct", ModelID: "model-old"},
+			{GroupKey: "standard", ModelID: "model-stale"},
+		},
+	)
+	require.NoError(t, err)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"direct":1}`))
+
+	updated, err := replaceContinuityGroupModelProbeExclusions(
+		[]continuityGroupModelProbeExclusion{
+			{GroupKey: "direct", ModelID: "model-new"},
+			{GroupKey: "standard", ModelID: "model-stale"},
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, []continuityGroupModelProbeExclusion{
+		{GroupKey: "direct", ModelID: "model-new"},
+		{GroupKey: "standard", ModelID: "model-stale"},
+	}, updated)
+
+	_, err = replaceContinuityGroupModelProbeExclusions(
+		[]continuityGroupModelProbeExclusion{
+			{GroupKey: "direct", ModelID: "model-new"},
+			{GroupKey: "missing", ModelID: "model-newly-stale"},
+			{GroupKey: "standard", ModelID: "model-stale"},
+		},
+	)
+	require.ErrorIs(t, err, errUnknownRoutingGroup)
+
+	loaded, err := loadContinuityGroupModelProbeExclusions()
+	require.NoError(t, err)
+	assert.Equal(t, updated, loaded)
+}
+
+func TestContinuityGroupModelProbeExclusionsSurfacePersistenceFailure(t *testing.T) {
+	database := setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"standard":1}`))
+	require.NoError(t, database.Migrator().DropTable(&model.Option{}))
+
+	_, err := replaceContinuityGroupModelProbeExclusions(
+		[]continuityGroupModelProbeExclusion{{
+			GroupKey: "standard",
+			ModelID:  "compat-model",
+		}},
+	)
+	require.Error(t, err)
+}
+
+func TestContinuityGroupModelProbeExclusionsRejectAmbiguousPairs(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"standard":1}`))
+
+	for _, pairs := range [][]continuityGroupModelProbeExclusion{
+		{
+			{GroupKey: "standard", ModelID: "model-a"},
+			{GroupKey: "standard", ModelID: "model-a"},
+		},
+		{{GroupKey: "missing", ModelID: "model-a"}},
+		{{GroupKey: "standard", ModelID: " model-a"}},
+		{{GroupKey: "standard", ModelID: "model-\ninvalid"}},
+	} {
+		_, err := replaceContinuityGroupModelProbeExclusions(pairs)
+		require.Error(t, err)
+	}
 }
 
 func TestUpdateContinuityManagedTokenGroupsRequiresOwnerAndExactGroupKey(t *testing.T) {
