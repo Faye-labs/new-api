@@ -11,10 +11,8 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/samber/lo"
@@ -44,25 +42,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
 	}
 
-	includeUsage := true
-	// 判断用户是否需要返回使用情况
-	if request.StreamOptions != nil {
-		includeUsage = request.StreamOptions.IncludeUsage
-	}
-
-	// 如果不支持StreamOptions，将StreamOptions设置为nil
-	if !info.SupportStreamOptions || !lo.FromPtrOr(request.Stream, false) {
-		request.StreamOptions = nil
-	} else {
-		// 如果支持StreamOptions，且请求中没有设置StreamOptions，根据配置文件设置StreamOptions
-		if constant.ForceStreamOption {
-			request.StreamOptions = &dto.StreamOptions{
-				IncludeUsage: true,
-			}
-		}
-	}
-
-	info.ShouldIncludeUsage = includeUsage
+	NormalizeChatCompletionsStreamOptions(info, request)
 
 	adaptor := GetAdaptor(info.ApiType)
 	if adaptor == nil {
@@ -70,12 +50,9 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	}
 	adaptor.Init(info)
 
-	passThroughGlobal := model_setting.GetGlobalSettings().PassThroughRequestEnabled
-	if info.RelayMode == relayconstant.RelayModeChatCompletions &&
-		!passThroughGlobal &&
-		!info.ChannelSetting.PassThroughBodyEnabled &&
-		service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName) {
-		applySystemPromptIfNeeded(c, info, request)
+	routing := ResolveChatCompletionsRouting(info)
+	if routing.UseResponsesCompatibility {
+		ApplyChatCompletionsSystemPrompt(c, info, request)
 		usage, newApiErr := chatCompletionsViaResponses(c, info, adaptor, request)
 		if newApiErr != nil {
 			return newApiErr
@@ -94,7 +71,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 
 	var requestBody io.Reader
 
-	if passThroughGlobal || info.ChannelSetting.PassThroughBodyEnabled {
+	if routing.PassThroughGlobal || info.ChannelSetting.PassThroughBodyEnabled {
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -112,46 +89,8 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 		relaycommon.AppendRequestConversionFromRequest(info, convertedRequest)
 
-		if info.ChannelSetting.SystemPrompt != "" {
-			// 如果有系统提示，则将其添加到请求中
-			request, ok := convertedRequest.(*dto.GeneralOpenAIRequest)
-			if ok {
-				containSystemPrompt := false
-				for _, message := range request.Messages {
-					if message.Role == request.GetSystemRoleName() {
-						containSystemPrompt = true
-						break
-					}
-				}
-				if !containSystemPrompt {
-					// 如果没有系统提示，则添加系统提示
-					systemMessage := dto.Message{
-						Role:    request.GetSystemRoleName(),
-						Content: info.ChannelSetting.SystemPrompt,
-					}
-					request.Messages = append([]dto.Message{systemMessage}, request.Messages...)
-				} else if info.ChannelSetting.SystemPromptOverride {
-					common.SetContextKey(c, constant.ContextKeySystemPromptOverride, true)
-					// 如果有系统提示，且允许覆盖，则拼接到前面
-					for i, message := range request.Messages {
-						if message.Role == request.GetSystemRoleName() {
-							if message.IsStringContent() {
-								request.Messages[i].SetStringContent(info.ChannelSetting.SystemPrompt + "\n" + message.StringContent())
-							} else {
-								contents := message.ParseContent()
-								contents = append([]dto.MediaContent{
-									{
-										Type: dto.ContentTypeText,
-										Text: info.ChannelSetting.SystemPrompt,
-									},
-								}, contents...)
-								request.Messages[i].Content = contents
-							}
-							break
-						}
-					}
-				}
-			}
+		if convertedChatRequest, ok := convertedRequest.(*dto.GeneralOpenAIRequest); ok {
+			ApplyChatCompletionsSystemPrompt(c, info, convertedChatRequest)
 		}
 
 		jsonData, err := common.Marshal(convertedRequest)
@@ -220,4 +159,26 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), nil)
 	}
 	return nil
+}
+
+// NormalizeChatCompletionsStreamOptions applies the stream-options contract
+// shared by real chat traffic and synthetic status probes.
+func NormalizeChatCompletionsStreamOptions(info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) {
+	if info == nil || request == nil {
+		return
+	}
+	includeUsage := true
+	if request.StreamOptions != nil {
+		includeUsage = request.StreamOptions.IncludeUsage
+	}
+
+	if !info.SupportStreamOptions || !lo.FromPtrOr(request.Stream, false) {
+		request.StreamOptions = nil
+	} else if constant.ForceStreamOption {
+		request.StreamOptions = &dto.StreamOptions{
+			IncludeUsage: true,
+		}
+	}
+
+	info.ShouldIncludeUsage = includeUsage
 }

@@ -14,12 +14,15 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 )
 
-func applySystemPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) {
+// ApplyChatCompletionsSystemPrompt applies the channel-level system prompt to
+// an OpenAI-compatible request using the same rules as TextHelper.
+func ApplyChatCompletionsSystemPrompt(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) {
 	if info == nil || request == nil {
 		return
 	}
@@ -70,7 +73,42 @@ func applySystemPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, requ
 	}
 }
 
-func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, request *dto.GeneralOpenAIRequest) (*dto.Usage, *types.NewAPIError) {
+type TextRequestRouting struct {
+	PassThroughGlobal         bool
+	UseResponsesCompatibility bool
+}
+
+func resolveTextRequestRouting(info *relaycommon.RelayInfo, compatibilityEligible bool) TextRequestRouting {
+	routing := TextRequestRouting{
+		PassThroughGlobal: model_setting.GetGlobalSettings().PassThroughRequestEnabled,
+	}
+	if info == nil || !compatibilityEligible {
+		return routing
+	}
+	routing.UseResponsesCompatibility = !routing.PassThroughGlobal &&
+		!info.ChannelSetting.PassThroughBodyEnabled &&
+		service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName)
+	return routing
+}
+
+// ResolveChatCompletionsRouting takes one global-settings snapshot and applies
+// the same Responses compatibility decision as TextHelper. Synthetic traffic
+// must use this result instead of guessing from a channel or model name.
+func ResolveChatCompletionsRouting(info *relaycommon.RelayInfo) TextRequestRouting {
+	return resolveTextRequestRouting(info, info != nil && info.RelayMode == relayconstant.RelayModeChatCompletions)
+}
+
+// ResolveClaudeRouting takes the equivalent routing snapshot for the native
+// Messages entry point, which can also be configured to use Responses.
+func ResolveClaudeRouting(info *relaycommon.RelayInfo) TextRequestRouting {
+	return resolveTextRequestRouting(info, info != nil)
+}
+
+// ConvertChatCompletionsToResponsesRequest applies the request-side portion of
+// NewAPI's Chat Completions -> Responses compatibility route. It intentionally
+// includes disabled-field filtering and channel parameter overrides because
+// those happen before conversion for real user requests.
+func ConvertChatCompletionsToResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (*dto.OpenAIResponsesRequest, *types.NewAPIError) {
 	chatJSON, err := common.Marshal(request)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
@@ -100,6 +138,14 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 	responsesReq, ok := result.Value.(*dto.OpenAIResponsesRequest)
 	if !ok {
 		return nil, types.NewError(fmt.Errorf("expected OpenAI responses request, got %T", result.Value), types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+	return responsesReq, nil
+}
+
+func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, request *dto.GeneralOpenAIRequest) (*dto.Usage, *types.NewAPIError) {
+	responsesReq, newApiErr := ConvertChatCompletionsToResponsesRequest(c, info, request)
+	if newApiErr != nil {
+		return nil, newApiErr
 	}
 
 	savedRelayMode := info.RelayMode

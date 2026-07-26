@@ -21,32 +21,47 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
-
-	info.InitChannelMeta(c)
-
-	claudeReq, ok := info.Request.(*dto.ClaudeRequest)
-
-	if !ok {
-		return types.NewErrorWithStatusCode(fmt.Errorf("invalid request type, expected *dto.ClaudeRequest, got %T", info.Request), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+// ApplyClaudeSystemPrompt applies the channel-level system prompt using the
+// same native Messages semantics as ClaudeHelper.
+func ApplyClaudeSystemPrompt(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) {
+	if info == nil || request == nil || info.ChannelSetting.SystemPrompt == "" {
+		return
+	}
+	if request.System == nil {
+		request.SetStringSystem(info.ChannelSetting.SystemPrompt)
+		return
+	}
+	if !info.ChannelSetting.SystemPromptOverride {
+		return
 	}
 
-	request, err := common.DeepCopy(claudeReq)
-	if err != nil {
-		return types.NewError(fmt.Errorf("failed to copy request to ClaudeRequest: %w", err), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, true)
+	if request.IsStringSystem() {
+		existing := strings.TrimSpace(request.GetStringSystem())
+		if existing == "" {
+			request.SetStringSystem(info.ChannelSetting.SystemPrompt)
+		} else {
+			request.SetStringSystem(info.ChannelSetting.SystemPrompt + "\n" + existing)
+		}
+		return
 	}
 
-	err = helper.ModelMappedHelper(c, info, request)
-	if err != nil {
-		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
+	systemContents := request.ParseSystem()
+	newSystem := dto.ClaudeMediaMessage{Type: dto.ContentTypeText}
+	newSystem.SetText(info.ChannelSetting.SystemPrompt)
+	if len(systemContents) == 0 {
+		request.System = []dto.ClaudeMediaMessage{newSystem}
+	} else {
+		request.System = append([]dto.ClaudeMediaMessage{newSystem}, systemContents...)
 	}
+}
 
-	adaptor := GetAdaptor(info.ApiType)
-	if adaptor == nil {
-		return types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
+// PrepareClaudeRequest applies the model-specific normalization performed by
+// ClaudeHelper before an adaptor sees the request.
+func PrepareClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) {
+	if info == nil || request == nil {
+		return
 	}
-	adaptor.Init(info)
-
 	if request.MaxTokens == nil || *request.MaxTokens == 0 {
 		defaultMaxTokens := uint(model_setting.GetClaudeSettings().GetDefaultMaxTokens(request.Model))
 		request.MaxTokens = &defaultMaxTokens
@@ -86,18 +101,14 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 				request.TopP = nil
 				request.TopK = nil
 			} else {
-				// 因为BudgetTokens 必须大于1024
+				// BudgetTokens must be greater than 1024.
 				if request.MaxTokens == nil || *request.MaxTokens < 1280 {
 					request.MaxTokens = common.GetPointer[uint](1280)
 				}
-
-				// BudgetTokens 为 max_tokens 的 80%
 				request.Thinking = &dto.Thinking{
 					Type:         "enabled",
 					BudgetTokens: common.GetPointer[int](int(float64(*request.MaxTokens) * model_setting.GetClaudeSettings().ThinkingAdapterBudgetTokensPercentage)),
 				}
-				// TODO: 临时处理
-				// https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#important-considerations-when-using-extended-thinking
 				request.Temperature = common.GetPointer[float64](1.0)
 			}
 		}
@@ -107,34 +118,39 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		info.UpstreamModelName = request.Model
 	}
 
-	if info.ChannelSetting.SystemPrompt != "" {
-		if request.System == nil {
-			request.SetStringSystem(info.ChannelSetting.SystemPrompt)
-		} else if info.ChannelSetting.SystemPromptOverride {
-			common.SetContextKey(c, constant.ContextKeySystemPromptOverride, true)
-			if request.IsStringSystem() {
-				existing := strings.TrimSpace(request.GetStringSystem())
-				if existing == "" {
-					request.SetStringSystem(info.ChannelSetting.SystemPrompt)
-				} else {
-					request.SetStringSystem(info.ChannelSetting.SystemPrompt + "\n" + existing)
-				}
-			} else {
-				systemContents := request.ParseSystem()
-				newSystem := dto.ClaudeMediaMessage{Type: dto.ContentTypeText}
-				newSystem.SetText(info.ChannelSetting.SystemPrompt)
-				if len(systemContents) == 0 {
-					request.System = []dto.ClaudeMediaMessage{newSystem}
-				} else {
-					request.System = append([]dto.ClaudeMediaMessage{newSystem}, systemContents...)
-				}
-			}
-		}
+	ApplyClaudeSystemPrompt(c, info, request)
+}
+
+func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
+
+	info.InitChannelMeta(c)
+
+	claudeReq, ok := info.Request.(*dto.ClaudeRequest)
+
+	if !ok {
+		return types.NewErrorWithStatusCode(fmt.Errorf("invalid request type, expected *dto.ClaudeRequest, got %T", info.Request), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
 
-	if !model_setting.GetGlobalSettings().PassThroughRequestEnabled &&
-		!info.ChannelSetting.PassThroughBodyEnabled &&
-		service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName) {
+	request, err := common.DeepCopy(claudeReq)
+	if err != nil {
+		return types.NewError(fmt.Errorf("failed to copy request to ClaudeRequest: %w", err), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+
+	err = helper.ModelMappedHelper(c, info, request)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeChannelModelMappedError, types.ErrOptionWithSkipRetry())
+	}
+
+	adaptor := GetAdaptor(info.ApiType)
+	if adaptor == nil {
+		return types.NewError(fmt.Errorf("invalid api type: %d", info.ApiType), types.ErrorCodeInvalidApiType, types.ErrOptionWithSkipRetry())
+	}
+	adaptor.Init(info)
+
+	PrepareClaudeRequest(c, info, request)
+
+	routing := ResolveClaudeRouting(info)
+	if routing.UseResponsesCompatibility {
 		result, convErr := service.ConvertRequest(c, info, types.RelayFormatOpenAI, request)
 		if convErr != nil {
 			return types.NewError(convErr, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
@@ -154,7 +170,7 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 	}
 
 	var requestBody io.Reader
-	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
+	if routing.PassThroughGlobal || info.ChannelSetting.PassThroughBodyEnabled {
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())

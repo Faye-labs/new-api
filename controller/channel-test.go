@@ -44,7 +44,15 @@ type testResult struct {
 type channelTestOptions struct {
 	group            string
 	recordConsumeLog bool
+	requestProfile   channelTestRequestProfile
 }
+
+type channelTestRequestProfile uint8
+
+const (
+	channelTestRequestProfileDefault channelTestRequestProfile = iota
+	channelTestRequestProfileContinuityProbe
+)
 
 type ChannelProbeStatus string
 
@@ -115,6 +123,7 @@ func isKnownChatProbeModel(modelName string) bool {
 		"nova-",
 		"phi-",
 		"qwen",
+		"seed",
 		"sonar",
 		"yi-",
 	}
@@ -152,12 +161,12 @@ func resolveChannelProbeEndpoint(channel *model.Channel, modelName string) (stri
 		return string(constant.EndpointTypeOpenAIResponseCompact), true
 	}
 	lowerModelName := strings.ToLower(modelName)
-	if channel.Type == constant.ChannelTypeCodex ||
-		strings.Contains(lowerModelName, "codex") ||
-		common.IsOpenAIResponseOnlyModel(modelName) {
-		return string(constant.EndpointTypeOpenAIResponse), true
+	// Continuity sends Claude through the native Messages API. Every other
+	// managed text model enters NewAPI through OpenAI chat completions, including
+	// Codex and responses-only models that NewAPI adapts internally.
+	if strings.Contains(lowerModelName, "claude") {
+		return string(constant.EndpointTypeAnthropic), true
 	}
-
 	// Ability rows do not identify a request path. These model families require
 	// endpoint-specific request bodies that the synthetic text probe cannot
 	// infer safely, so leave them unknown instead of reporting a false outage.
@@ -170,6 +179,7 @@ func resolveChannelProbeEndpoint(channel *model.Channel, modelName string) (stri
 		"imagen",
 		"moderation",
 		"realtime",
+		"seedance",
 		"seedream",
 		"speech",
 		"sora",
@@ -402,7 +412,7 @@ func testChannelWithOptions(ctx context.Context, channel *model.Channel, testUse
 		}
 	}
 
-	request := buildTestRequest(testModel, endpointType, channel, isStream)
+	request := buildTestRequest(testModel, endpointType, channel, isStream, options.requestProfile)
 
 	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
 
@@ -478,6 +488,7 @@ func testChannelWithOptions(ctx context.Context, channel *model.Channel, testUse
 	adaptor.Init(info)
 
 	var convertedRequest any
+	requestCompatibilityApplied := false
 	// 根据 RelayMode 选择正确的转换函数
 	switch info.RelayMode {
 	case relayconstant.RelayModeEmbeddings:
@@ -545,13 +556,72 @@ func testChannelWithOptions(ctx context.Context, channel *model.Channel, testUse
 		}
 	default:
 		// Chat/Completion 等其他请求类型
-		if generalReq, ok := request.(*dto.GeneralOpenAIRequest); ok {
-			convertedRequest, err = adaptor.ConvertOpenAIRequest(c, info, generalReq)
-		} else {
+		switch typedRequest := request.(type) {
+		case *dto.GeneralOpenAIRequest:
+			if options.requestProfile == channelTestRequestProfileContinuityProbe {
+				relay.NormalizeChatCompletionsStreamOptions(info, typedRequest)
+			}
+			routing := relay.ResolveChatCompletionsRouting(info)
+			if options.requestProfile == channelTestRequestProfileContinuityProbe && routing.UseResponsesCompatibility {
+				relay.ApplyChatCompletionsSystemPrompt(c, info, typedRequest)
+				responsesRequest, compatibilityErr := relay.ConvertChatCompletionsToResponsesRequest(c, info, typedRequest)
+				if compatibilityErr != nil {
+					return testResult{
+						context:     c,
+						localErr:    compatibilityErr,
+						newAPIError: compatibilityErr,
+					}
+				}
+				info.RelayMode = relayconstant.RelayModeResponses
+				info.RequestURLPath = "/v1/responses"
+				convertedRequest, err = adaptor.ConvertOpenAIResponsesRequest(c, info, *responsesRequest)
+				requestCompatibilityApplied = true
+			} else {
+				convertedRequest, err = adaptor.ConvertOpenAIRequest(c, info, typedRequest)
+			}
+		case *dto.ClaudeRequest:
+			if options.requestProfile == channelTestRequestProfileContinuityProbe {
+				relay.PrepareClaudeRequest(c, info, typedRequest)
+			}
+			routing := relay.ResolveClaudeRouting(info)
+			if options.requestProfile == channelTestRequestProfileContinuityProbe && routing.UseResponsesCompatibility {
+				result, conversionErr := service.ConvertRequest(c, info, types.RelayFormatOpenAI, typedRequest)
+				if conversionErr != nil {
+					return testResult{
+						context:     c,
+						localErr:    conversionErr,
+						newAPIError: types.NewError(conversionErr, types.ErrorCodeConvertRequestFailed),
+					}
+				}
+				openAIRequest, ok := result.Value.(*dto.GeneralOpenAIRequest)
+				if !ok {
+					conversionErr = fmt.Errorf("expected OpenAI chat completions request, got %T", result.Value)
+					return testResult{
+						context:     c,
+						localErr:    conversionErr,
+						newAPIError: types.NewError(conversionErr, types.ErrorCodeConvertRequestFailed),
+					}
+				}
+				responsesRequest, compatibilityErr := relay.ConvertChatCompletionsToResponsesRequest(c, info, openAIRequest)
+				if compatibilityErr != nil {
+					return testResult{
+						context:     c,
+						localErr:    compatibilityErr,
+						newAPIError: compatibilityErr,
+					}
+				}
+				info.RelayMode = relayconstant.RelayModeResponses
+				info.RequestURLPath = "/v1/responses"
+				convertedRequest, err = adaptor.ConvertOpenAIResponsesRequest(c, info, *responsesRequest)
+				requestCompatibilityApplied = true
+			} else {
+				convertedRequest, err = adaptor.ConvertClaudeRequest(c, info, typedRequest)
+			}
+		default:
 			return testResult{
 				context:     c,
-				localErr:    errors.New("invalid general request type"),
-				newAPIError: types.NewError(errors.New("invalid general request type"), types.ErrorCodeConvertRequestFailed),
+				localErr:    fmt.Errorf("invalid chat request type: %T", request),
+				newAPIError: types.NewError(fmt.Errorf("invalid chat request type: %T", request), types.ErrorCodeConvertRequestFailed),
 			}
 		}
 	}
@@ -563,6 +633,12 @@ func testChannelWithOptions(ctx context.Context, channel *model.Channel, testUse
 			newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed),
 		}
 	}
+	if options.requestProfile == channelTestRequestProfileContinuityProbe && !requestCompatibilityApplied {
+		if convertedChatRequest, ok := convertedRequest.(*dto.GeneralOpenAIRequest); ok &&
+			info.RelayMode == relayconstant.RelayModeChatCompletions {
+			relay.ApplyChatCompletionsSystemPrompt(c, info, convertedChatRequest)
+		}
+	}
 	jsonData, err := common.Marshal(convertedRequest)
 	if err != nil {
 		return testResult{
@@ -572,16 +648,18 @@ func testChannelWithOptions(ctx context.Context, channel *model.Channel, testUse
 		}
 	}
 
-	//jsonData, err = relaycommon.RemoveDisabledFields(jsonData, info.ChannelOtherSettings)
-	//if err != nil {
-	//	return testResult{
-	//		context:     c,
-	//		localErr:    err,
-	//		newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed),
-	//	}
-	//}
+	if options.requestProfile == channelTestRequestProfileContinuityProbe {
+		jsonData, err = relaycommon.RemoveDisabledFields(jsonData, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
+		if err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed),
+			}
+		}
+	}
 
-	if len(info.ParamOverride) > 0 {
+	if len(info.ParamOverride) > 0 && !requestCompatibilityApplied {
 		jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
 		if err != nil {
 			if fixedErr, ok := relaycommon.AsParamOverrideReturnError(err); ok {
@@ -716,16 +794,24 @@ func ProbeChannel(ctx context.Context, channel *model.Channel, modelName string,
 	if err != nil {
 		return ChannelProbeResult{Status: ChannelProbeStatusIndeterminate}
 	}
+	probeEndpoint := constant.EndpointType(endpointType)
+	// Embeddings, rerank, and responses compaction have no streaming contract.
+	// Every generative endpoint mirrors Continuity's always-streaming chat path.
+	isStream := probeEndpoint == constant.EndpointTypeOpenAI ||
+		probeEndpoint == constant.EndpointTypeOpenAIResponse ||
+		probeEndpoint == constant.EndpointTypeAnthropic ||
+		probeEndpoint == constant.EndpointTypeGemini
 	result := testChannelWithOptions(
 		ctx,
 		cloneChannelForProbe(channel),
 		testUserID,
 		modelName,
 		endpointType,
-		shouldUseStreamForAutomaticChannelTest(channel),
+		isStream,
 		channelTestOptions{
 			group:            group,
 			recordConsumeLog: false,
+			requestProfile:   channelTestRequestProfileContinuityProbe,
 		},
 	)
 	latencyMs := time.Since(startedAt).Milliseconds()
@@ -925,7 +1011,7 @@ func detectErrorMessageFromJSONBytes(jsonBytes []byte) string {
 	return message
 }
 
-func buildTestRequest(model string, endpointType string, channel *model.Channel, isStream bool) dto.Request {
+func buildTestRequest(model string, endpointType string, channel *model.Channel, isStream bool, requestProfile channelTestRequestProfile) dto.Request {
 	testResponsesInput := json.RawMessage(`[{"role":"user","content":"hi"}]`)
 
 	// 根据端点类型构建不同的测试请求
@@ -966,10 +1052,33 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 				Model: model,
 				Input: testResponsesInput,
 			}
-		case constant.EndpointTypeAnthropic, constant.EndpointTypeGemini, constant.EndpointTypeOpenAI:
+		case constant.EndpointTypeAnthropic:
+			if requestProfile == channelTestRequestProfileContinuityProbe {
+				maxTokens := uint(8192)
+				cacheText := "You are a connectivity probe. Reply with OK."
+				return &dto.ClaudeRequest{
+					Model:     model,
+					MaxTokens: &maxTokens,
+					Stream:    lo.ToPtr(isStream),
+					System: []dto.ClaudeMediaMessage{
+						{
+							Type:         "text",
+							Text:         &cacheText,
+							CacheControl: json.RawMessage(`{"type":"ephemeral","ttl":"1h"}`),
+						},
+					},
+					Messages: []dto.ClaudeMessage{
+						{Role: "user", Content: "OK"},
+					},
+				}
+			}
+			fallthrough
+		case constant.EndpointTypeGemini, constant.EndpointTypeOpenAI:
 			// 返回 GeneralOpenAIRequest
 			maxTokens := uint(16)
-			if constant.EndpointType(endpointType) == constant.EndpointTypeGemini {
+			if requestProfile == channelTestRequestProfileContinuityProbe {
+				maxTokens = 8192
+			} else if constant.EndpointType(endpointType) == constant.EndpointTypeGemini {
 				maxTokens = 3000
 			}
 			req := &dto.GeneralOpenAIRequest{
@@ -985,6 +1094,9 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 			}
 			if isStream {
 				req.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
+			}
+			if requestProfile == channelTestRequestProfileContinuityProbe && strings.Contains(strings.ToLower(model), "gemini") {
+				req.ReasoningEffort = "low"
 			}
 			return req
 		}
