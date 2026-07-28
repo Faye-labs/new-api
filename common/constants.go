@@ -197,6 +197,14 @@ var CohereSafetySetting string
 const (
 	RequestIdKey         = "X-Oneapi-Request-Id"
 	UpstreamRequestIdKey = "X-Upstream-Request-Id"
+	// ContinuityAccountAPIRequestBoundKey and
+	// ContinuityAccountAPILogWriteFailedKey are request-local markers used by
+	// the optional Continuity extension. They do not alter ordinary relay
+	// requests; the extension sets them only after a trusted Account API
+	// request binding has been verified.
+	ContinuityAccountAPIRequestBoundKey   = "continuity_account_api_request_bound"
+	ContinuityAccountAPILogWriteFailedKey = "continuity_account_api_log_write_failed"
+	ContinuityAccountAPILogCollectorKey   = "continuity_account_api_log_collector"
 )
 
 const (

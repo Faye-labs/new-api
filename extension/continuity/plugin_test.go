@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/gin-gonic/gin"
@@ -19,9 +20,23 @@ func TestPluginCanBeDisabledWithoutMountingRoutes(t *testing.T) {
 	assert.False(t, (plugin{}).Enabled())
 }
 
+func TestAccountAPIDataPlaneMiddlewareDefaultsOffIndependently(t *testing.T) {
+	secret := strings.Repeat("p", 32)
+	t.Setenv(ContinuityInternalAPISecretEnv, secret)
+	t.Setenv(ContinuityAccountAPIEnabledEnv, "")
+	assert.Nil(t, (plugin{}).RelayV1Middleware())
+
+	t.Setenv(ContinuityAccountAPIEnabledEnv, "1")
+	assert.NotNil(t, (plugin{}).RelayV1Middleware())
+
+	t.Setenv(ContinuityInternalAPISecretEnv, "short")
+	assert.Nil(t, (plugin{}).RelayV1Middleware())
+}
+
 func TestCapabilitiesExposeVersionedHostContract(t *testing.T) {
 	secret := strings.Repeat("c", 32)
 	t.Setenv(ContinuityInternalAPISecretEnv, secret)
+	t.Setenv(ContinuityAccountAPIEnabledEnv, "1")
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	(plugin{}).Mount(router)
@@ -45,6 +60,9 @@ func TestCapabilitiesExposeVersionedHostContract(t *testing.T) {
 	assert.Equal(t, 1, body.Data.ProtocolVersion)
 	assert.Equal(t, "single_process_population_fence_v1", body.Data.CacheCoherency)
 	assert.Equal(t, []string{
+		"account_api_requests.finality.read",
+		"account_api_requests.trusted_binding.v1",
+		"account_api_tokens.disable",
 		"group_model_status.checks.read",
 		"group_model_status.checks.write",
 		"group_model_status.exclusions.read",
@@ -54,6 +72,96 @@ func TestCapabilitiesExposeVersionedHostContract(t *testing.T) {
 		"token_groups.batch_write",
 		"user_group.write",
 	}, body.Data.Capabilities)
+}
+
+func TestCapabilitiesDoNotAdvertiseTrustedBindingWhileDataPlaneIsOff(t *testing.T) {
+	secret := strings.Repeat("q", 32)
+	t.Setenv(ContinuityInternalAPISecretEnv, secret)
+	t.Setenv(ContinuityAccountAPIEnabledEnv, "")
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	(plugin{}).Mount(router)
+
+	request := httptest.NewRequest(http.MethodGet, "/internal/continuity/capabilities", nil)
+	request.Header.Set("Authorization", "Bearer "+secret)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code)
+	var body struct {
+		Data struct {
+			Capabilities []string `json:"capabilities"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
+	assert.NotContains(t, body.Data.Capabilities, "account_api_requests.trusted_binding.v1")
+	assert.Contains(t, body.Data.Capabilities, "account_api_requests.finality.read")
+}
+
+func TestAccountAPITokenDisableEndpointIsOwnerBoundAndIdempotent(t *testing.T) {
+	database := setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, database.Create(&model.Token{
+		Id:     701,
+		UserId: 91,
+		Key:    "hidden-account-api-key",
+		Name:   "continuity-account-api-managed",
+		Status: common.TokenStatusEnabled,
+	}).Error)
+	secret := strings.Repeat("d", 32)
+	t.Setenv(ContinuityInternalAPISecretEnv, secret)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	(plugin{}).Mount(router)
+
+	disable := func(userID string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/internal/continuity/account-api/tokens/701/disable",
+			strings.NewReader(`{"user_id":`+userID+`}`),
+		)
+		request.Header.Set("Authorization", "Bearer "+secret)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	wrongOwner := disable("92")
+	require.Equal(t, http.StatusConflict, wrongOwner.Code)
+	var stillActive model.Token
+	require.NoError(t, database.First(&stillActive, 701).Error)
+	assert.Equal(t, common.TokenStatusEnabled, stillActive.Status)
+
+	first := disable("91")
+	require.Equal(t, http.StatusOK, first.Code)
+	assert.Equal(t, "no-store", first.Header().Get("Cache-Control"))
+	var firstBody struct {
+		Success bool `json:"success"`
+		Data    struct {
+			TokenID int  `json:"token_id"`
+			UserID  int  `json:"user_id"`
+			Changed bool `json:"changed"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(first.Body.Bytes(), &firstBody))
+	assert.True(t, firstBody.Success)
+	assert.Equal(t, 701, firstBody.Data.TokenID)
+	assert.Equal(t, 91, firstBody.Data.UserID)
+	assert.True(t, firstBody.Data.Changed)
+
+	second := disable("91")
+	require.Equal(t, http.StatusOK, second.Code)
+	var secondBody struct {
+		Data struct {
+			Changed bool `json:"changed"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(second.Body.Bytes(), &secondBody))
+	assert.False(t, secondBody.Data.Changed)
+
+	var disabled model.Token
+	require.NoError(t, database.Unscoped().First(&disabled, 701).Error)
+	assert.Equal(t, common.TokenStatusDisabled, disabled.Status)
+	assert.True(t, disabled.DeletedAt.Valid)
 }
 
 func TestProbeExclusionEndpointRequiresExplicitReadinessInitialization(t *testing.T) {

@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 
@@ -10,11 +11,21 @@ import (
 )
 
 var (
-	ErrContinuityManagedUserNotFound       = errors.New("continuity managed user not found")
-	ErrContinuityManagedTokenNotFound      = errors.New("continuity managed token not found")
-	ErrContinuityManagedTokenDisabled      = errors.New("continuity managed token is not enabled")
-	ErrContinuityManagedTokenOwnerMismatch = errors.New("continuity managed token owner mismatch")
+	ErrContinuityManagedUserNotFound          = errors.New("continuity managed user not found")
+	ErrContinuityManagedTokenNotFound         = errors.New("continuity managed token not found")
+	ErrContinuityManagedTokenDisabled         = errors.New("continuity managed token is not enabled")
+	ErrContinuityManagedTokenOwnerMismatch    = errors.New("continuity managed token owner mismatch")
+	ErrContinuityManagedTokenIdentityMismatch = errors.New("continuity managed token identity mismatch")
 )
+
+const continuityAccountAPITokenName = "continuity-account-api-managed"
+
+// IsContinuityAccountAPIToken reports whether a token carries the fixed
+// Account API domain marker. The caller must still bind the exact token id and
+// user id; the name alone never establishes ownership.
+func IsContinuityAccountAPIToken(token *Token) bool {
+	return token != nil && token.Name == continuityAccountAPITokenName
+}
 
 type ContinuityManagedTokenGroupUpdate struct {
 	TokenID int
@@ -27,6 +38,82 @@ type ContinuityManagedTokenGroupResult struct {
 	UserID  int
 	Group   string
 	Changed bool
+}
+
+// DisableContinuityAccountAPIToken disables and soft-deletes one exact hidden
+// Account API token. The durable user/token identity is checked before the
+// fixed domain name, and the cache population fence is advanced synchronously
+// after the database commit so a concurrent stale read cannot repopulate it.
+func DisableContinuityAccountAPIToken(userID int, tokenID int) (bool, error) {
+	changed := false
+	var tokenKey string
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var token Token
+		if err := lockForUpdate(tx.Unscoped()).Where("id = ?", tokenID).First(&token).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: token_id=%d", ErrContinuityManagedTokenNotFound, tokenID)
+			}
+			return err
+		}
+		if token.UserId != userID {
+			return fmt.Errorf(
+				"%w: token_id=%d expected_user_id=%d",
+				ErrContinuityManagedTokenOwnerMismatch,
+				tokenID,
+				userID,
+			)
+		}
+		if token.Name != continuityAccountAPITokenName {
+			return fmt.Errorf(
+				"%w: token_id=%d",
+				ErrContinuityManagedTokenIdentityMismatch,
+				tokenID,
+			)
+		}
+		tokenKey = token.Key
+		if token.Status == common.TokenStatusDisabled && token.DeletedAt.Valid {
+			return nil
+		}
+
+		result := tx.Unscoped().Model(&Token{}).
+			Where("id = ? AND user_id = ? AND name = ?", tokenID, userID, continuityAccountAPITokenName).
+			Updates(map[string]interface{}{
+				"status":     common.TokenStatusDisabled,
+				"deleted_at": time.Now(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("continuity managed Account API token changed during disable: token_id=%d", tokenID)
+		}
+		changed = true
+
+		var disabled Token
+		if err := tx.Unscoped().Where("id = ? AND user_id = ?", tokenID, userID).First(&disabled).Error; err != nil {
+			return err
+		}
+		if disabled.Name != continuityAccountAPITokenName ||
+			disabled.Status != common.TokenStatusDisabled ||
+			!disabled.DeletedAt.Valid {
+			return fmt.Errorf("continuity managed Account API token did not become inactive: token_id=%d", tokenID)
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+
+	cacheErr := invalidateCachesAfterMutation(func() error {
+		if !common.RedisEnabled || tokenKey == "" {
+			return nil
+		}
+		return cacheDeleteToken(tokenKey)
+	})
+	if cacheErr != nil {
+		return changed, fmt.Errorf("continuity managed Account API token disabled but cache invalidation failed: %w", cacheErr)
+	}
+	return changed, nil
 }
 
 func UpdateContinuityManagedUserGroup(userID int, group string) (bool, error) {

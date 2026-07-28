@@ -105,6 +105,51 @@ func TestUpdateContinuityManagedTokenGroupsRejectsDisabledToken(t *testing.T) {
 	assert.Equal(t, "old", stored.Group)
 }
 
+func TestDisableContinuityAccountAPITokenIsIdentityBoundAndIdempotent(t *testing.T) {
+	database := setupContinuityManagedGroupsDB(t)
+	tokens := []Token{
+		{
+			Id:     31,
+			UserId: 7,
+			Key:    "account-api-token",
+			Name:   continuityAccountAPITokenName,
+			Status: common.TokenStatusEnabled,
+		},
+		{
+			Id:     32,
+			UserId: 7,
+			Key:    "ordinary-managed-token",
+			Name:   "one_ordinary-chat-managed",
+			Status: common.TokenStatusEnabled,
+		},
+	}
+	require.NoError(t, database.Create(&tokens).Error)
+
+	_, err := DisableContinuityAccountAPIToken(8, 31)
+	require.ErrorIs(t, err, ErrContinuityManagedTokenOwnerMismatch)
+	_, err = DisableContinuityAccountAPIToken(7, 32)
+	require.ErrorIs(t, err, ErrContinuityManagedTokenIdentityMismatch)
+
+	changed, err := DisableContinuityAccountAPIToken(7, 31)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	var disabled Token
+	require.NoError(t, database.Unscoped().First(&disabled, 31).Error)
+	assert.Equal(t, common.TokenStatusDisabled, disabled.Status)
+	assert.True(t, disabled.DeletedAt.Valid)
+
+	revision := currentCachePopulationRevision()
+	changed, err = DisableContinuityAccountAPIToken(7, 31)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Greater(t, currentCachePopulationRevision(), revision)
+
+	var ordinary Token
+	require.NoError(t, database.First(&ordinary, 32).Error)
+	assert.Equal(t, common.TokenStatusEnabled, ordinary.Status)
+	assert.False(t, ordinary.DeletedAt.Valid)
+}
+
 func TestGetContinuityRoutingGroupDetailsReturnsSortedEnabledModels(t *testing.T) {
 	database := setupContinuityManagedGroupsDB(t)
 	abilities := []Ability{

@@ -19,25 +19,53 @@ validation, protocol and routing-group catalog live under
 `extension/continuity/`. Removing that import and package removes the
 extension without editing NewAPI's API router.
 
-The extension is enabled only when `CONTINUITY_INTERNAL_API_SECRET` is
-non-empty. An invalid configured secret leaves the mounted API fail-closed;
+The internal extension is enabled only when `CONTINUITY_INTERNAL_API_SECRET`
+is non-empty. An invalid configured secret leaves the mounted API fail-closed;
 an absent secret leaves the routes unmounted.
+
+Account API relay binding has an independent, default-off data-plane gate. It
+requires `CONTINUITY_ACCOUNT_API_ENABLED=1` (the exact string `1`) and a valid
+`CONTINUITY_INTERNAL_API_SECRET`. Setting the internal secret alone mounts the
+management/finality routes but does not enable external Account API relay
+traffic. This separation lets operators stage policy and retain finality reads
+for already-forwarded requests while the data plane is disabled.
 
 The model adapter remains in `model/continuity_managed_groups.go` because it
 must use NewAPI's cross-database transaction and cache primitives. It is the
 business adapter between the extension and NewAPI's private model layer.
 
-The only relay seam is `controller.ProbeChannel`. It reuses NewAPI's existing
-channel-test adaptor, model-mapping and response-validation path for one exact
-group/model/channel tuple, while deliberately skipping billing, consume-log
-creation, channel response-time mutation and automatic enable/disable logic.
+The data-plane binding uses the generic optional
+`extension.RelayV1MiddlewareProvider` seam. The Continuity plugin contributes
+middleware to `/v1` only while `CONTINUITY_ACCOUNT_API_ENABLED=1` and the
+internal secret is valid; that middleware is otherwise absent. While enabled,
+it remains inert unless private request-binding headers are present. This keeps
+the core relay router unaware of the Continuity package.
+
+The only active-probe relay seam is `controller.ProbeChannel`. It reuses
+NewAPI's existing channel-test adaptor, model-mapping and response-validation
+path for one exact group/model/channel tuple, while deliberately skipping
+billing, consume-log creation, channel response-time mutation and automatic
+enable/disable logic.
 Keep that exported seam narrow when resolving upstream changes; the probe
 scheduler and status policy belong in `extension/continuity/`.
 
 ## Compatibility contract
 
 `GET /internal/continuity/capabilities` is the versioned compatibility gate.
-Protocol version `1` advertises:
+Protocol version `1` always advertises these Account API control-plane
+capabilities while the internal extension is mounted:
+
+- `account_api_requests.finality.read`
+- `account_api_tokens.disable`
+
+It advertises `account_api_requests.trusted_binding.v1` only when
+`CONTINUITY_ACCOUNT_API_ENABLED=1` and the internal secret is valid. Gateway
+must require that capability before creating/reusing an Account API token or
+admitting a request. Turning the relay gate off removes only this capability;
+`account_api_requests.finality.read` remains available so historical holds can
+settle safely.
+
+The remaining protocol-version-1 capabilities and limits are:
 
 - `group_model_status.read`
 - `group_model_status.checks.read`
@@ -53,6 +81,35 @@ Protocol version `1` advertises:
 
 The `@continuity/api` client verifies this response before its first operation
 and fails closed on a missing or incompatible extension.
+
+Account API inference requests carry a timestamped HMAC over the exact NewAPI
+owner, token, request id, POST method and URL path. The extension accepts the
+binding only for the fixed Account API token domain, removes all private
+headers before relay, replaces and echoes `X-Oneapi-Request-Id`, and inserts a
+durable processing record before downstream work. Each successful synchronous
+error/consume log write is appended immediately to a request-local collector.
+After the relay chain returns, the extension atomically freezes that collector
+as `finalized`. It never treats an immediate read-after-write query as proof of
+absence, because a separate log database or ClickHouse may delay visibility.
+A log write/collection failure becomes `indeterminate`; it is never reported
+as a finalized empty bill.
+
+The generic token-auth guard also reserves that fixed token domain: a managed
+Account API token is rejected on every token-authenticated route unless the
+trusted `/v1` binding middleware has marked the request. This remains true
+when the relay gate is off or the extension secret is absent, preventing a
+stale unlimited hidden token from becoming directly usable during a
+configuration outage. Ordinary token names never enter this guard.
+
+The secret-authenticated finality endpoint is:
+
+- `GET /internal/continuity/account-api/users/:userId/tokens/:tokenId/requests/:requestId/outcome`
+
+The three path values are one exact lookup tuple. `processing` proves only that
+the request was admitted, while `finalized` is the terminal evidence that can
+drive settlement, including a finalized empty type-2 snapshot. Outcome storage
+is migrated lazily only after a trusted request or internal outcome lookup, so
+ordinary/default-off requests do not create or access this table.
 
 The status integration uses these secret-authenticated endpoints:
 

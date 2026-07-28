@@ -27,11 +27,32 @@ type continuityManagedTokenGroupsRequest struct {
 	Updates []continuityManagedTokenGroupUpdateRequest `json:"updates"`
 }
 
+type continuityAccountAPITokenDisableRequest struct {
+	UserID int `json:"user_id"`
+}
+
 type continuityGroupModelProbeExclusionsRequest struct {
 	Pairs *[]continuityGroupModelProbeExclusion `json:"pairs"`
 }
 
 func capabilitiesHandler(c *gin.Context) {
+	capabilities := []string{
+		"account_api_requests.finality.read",
+	}
+	if accountAPIDataPlaneEnabled() {
+		capabilities = append(capabilities, "account_api_requests.trusted_binding.v1")
+	}
+	capabilities = append(capabilities,
+		"account_api_tokens.disable",
+		"group_model_status.checks.read",
+		"group_model_status.checks.write",
+		"group_model_status.exclusions.read",
+		"group_model_status.exclusions.write",
+		"group_model_status.read",
+		"routing_groups.read",
+		"token_groups.batch_write",
+		"user_group.write",
+	)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -40,17 +61,61 @@ func capabilitiesHandler(c *gin.Context) {
 			"cache_coherency":       "single_process_population_fence_v1",
 			"group_key_max_bytes":   continuityManagedGroupMaxLength,
 			"token_group_batch_max": continuityManagedTokenBatchMax,
-			"capabilities": []string{
-				"group_model_status.checks.read",
-				"group_model_status.checks.write",
-				"group_model_status.exclusions.read",
-				"group_model_status.exclusions.write",
-				"group_model_status.read",
-				"routing_groups.read",
-				"token_groups.batch_write",
-				"user_group.write",
-			},
+			"capabilities":          capabilities,
 		},
+	})
+}
+
+func accountAPIRequestOutcomeHandler(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	userID, err := strconv.Atoi(c.Param("userId"))
+	if err != nil {
+		writeInternalError(c, errInvalidRequest)
+		return
+	}
+	tokenID, err := strconv.Atoi(c.Param("tokenId"))
+	if err != nil {
+		writeInternalError(c, errInvalidRequest)
+		return
+	}
+	outcome, err := getAccountAPIRequestOutcome(
+		userID,
+		tokenID,
+		c.Param("requestId"),
+	)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    outcome,
+	})
+}
+
+func disableAccountAPITokenHandler(c *gin.Context) {
+	tokenID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		writeInternalError(c, errInvalidRequest)
+		return
+	}
+
+	var request continuityAccountAPITokenDisableRequest
+	if err := common.DecodeJson(c.Request.Body, &request); err != nil {
+		writeInternalError(c, errInvalidRequest)
+		return
+	}
+	result, err := disableAccountAPIToken(request.UserID, tokenID)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data":    result,
 	})
 }
 
@@ -272,6 +337,14 @@ func writeInternalError(c *gin.Context, err error) {
 		status = http.StatusConflict
 		code = "token_owner_mismatch"
 		message = "Token owner does not match"
+	case errors.Is(err, model.ErrContinuityManagedTokenIdentityMismatch):
+		status = http.StatusConflict
+		code = "token_identity_mismatch"
+		message = "Token identity does not match"
+	case errors.Is(err, errAccountAPIRequestOutcomeNotFound):
+		status = http.StatusNotFound
+		code = "request_outcome_not_found"
+		message = "Account API request outcome was not found"
 	default:
 		common.SysLog(fmt.Sprintf("Continuity internal API error: %v", err))
 	}

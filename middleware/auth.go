@@ -385,6 +385,9 @@ func TokenAuth() func(c *gin.Context) {
 			}
 			return
 		}
+		if !runTokenAuthGuards(c, token) {
+			return
+		}
 
 		allowIps := token.GetIpLimits()
 		if len(allowIps) > 0 {

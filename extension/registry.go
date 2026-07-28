@@ -18,6 +18,13 @@ type Plugin interface {
 	Mount(router *gin.Engine)
 }
 
+// RelayV1MiddlewareProvider is an optional, narrow data-plane seam for source
+// extensions. The host evaluates it only for enabled plugins while assembling
+// /v1 relay routes, so disabled extensions do not enter the request chain.
+type RelayV1MiddlewareProvider interface {
+	RelayV1Middleware() gin.HandlerFunc
+}
+
 var pluginRegistry = struct {
 	sync.RWMutex
 	plugins map[string]Plugin
@@ -54,4 +61,27 @@ func MountAll(router *gin.Engine) {
 			plugin.Mount(router)
 		}
 	}
+}
+
+// RelayV1Middlewares returns middleware contributed by currently enabled
+// source extensions in deterministic registration order.
+func RelayV1Middlewares() []gin.HandlerFunc {
+	pluginRegistry.RLock()
+	plugins := make([]Plugin, 0, len(pluginRegistry.order))
+	for _, name := range pluginRegistry.order {
+		plugins = append(plugins, pluginRegistry.plugins[name])
+	}
+	pluginRegistry.RUnlock()
+
+	middlewares := make([]gin.HandlerFunc, 0)
+	for _, plugin := range plugins {
+		provider, ok := plugin.(RelayV1MiddlewareProvider)
+		if !ok || !plugin.Enabled() {
+			continue
+		}
+		if middleware := provider.RelayV1Middleware(); middleware != nil {
+			middlewares = append(middlewares, middleware)
+		}
+	}
+	return middlewares
 }

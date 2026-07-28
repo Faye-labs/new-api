@@ -103,6 +103,22 @@ func createLog(log *Log) error {
 	return LOG_DB.Create(log).Error
 }
 
+func collectContinuityAccountAPILog(c *gin.Context, log *Log) {
+	if !c.GetBool(common.ContinuityAccountAPIRequestBoundKey) {
+		return
+	}
+	value, exists := c.Get(common.ContinuityAccountAPILogCollectorKey)
+	collector, valid := value.(func(Log) error)
+	if !exists || !valid || log == nil {
+		c.Set(common.ContinuityAccountAPILogWriteFailedKey, true)
+		return
+	}
+	if err := collector(*log); err != nil {
+		c.Set(common.ContinuityAccountAPILogWriteFailedKey, true)
+		logger.LogError(c, "failed to collect Continuity Account API log: "+err.Error())
+	}
+}
+
 func clickHouseLogOrder(prefix string) string {
 	return prefix + "created_at desc, " + prefix + "request_id desc"
 }
@@ -321,7 +337,12 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 	}
 	err := createLog(log)
 	if err != nil {
+		if c.GetBool(common.ContinuityAccountAPIRequestBoundKey) {
+			c.Set(common.ContinuityAccountAPILogWriteFailedKey, true)
+		}
 		logger.LogError(c, "failed to record log: "+err.Error())
+	} else {
+		collectContinuityAccountAPILog(c, log)
 	}
 }
 
@@ -342,6 +363,9 @@ type RecordConsumeLogParams struct {
 
 func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams) {
 	if !common.LogConsumeEnabled {
+		if c.GetBool(common.ContinuityAccountAPIRequestBoundKey) {
+			c.Set(common.ContinuityAccountAPILogWriteFailedKey, true)
+		}
 		return
 	}
 	logger.LogInfo(c, fmt.Sprintf("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
@@ -385,7 +409,12 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 	}
 	err := createLog(log)
 	if err != nil {
+		if c.GetBool(common.ContinuityAccountAPIRequestBoundKey) {
+			c.Set(common.ContinuityAccountAPILogWriteFailedKey, true)
+		}
 		logger.LogError(c, "failed to record log: "+err.Error())
+	} else {
+		collectContinuityAccountAPILog(c, log)
 	}
 	if common.DataExportEnabled {
 		LogQuotaData(QuotaDataLogParams{

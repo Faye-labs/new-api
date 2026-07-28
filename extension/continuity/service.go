@@ -37,6 +37,12 @@ type managedTokenGroupResult struct {
 	Changed bool   `json:"changed"`
 }
 
+type accountAPITokenDisableResult struct {
+	TokenID int  `json:"token_id"`
+	UserID  int  `json:"user_id"`
+	Changed bool `json:"changed"`
+}
+
 type ContinuityRoutingGroup struct {
 	Key                string   `json:"key"`
 	Description        string   `json:"description"`
@@ -119,6 +125,21 @@ func updateManagedTokenGroups(updates []managedTokenGroupUpdate) ([]managedToken
 		})
 	}
 	return results, nil
+}
+
+func disableAccountAPIToken(userID int, tokenID int) (accountAPITokenDisableResult, error) {
+	if userID <= 0 || tokenID <= 0 {
+		return accountAPITokenDisableResult{}, errInvalidRequest
+	}
+	changed, err := model.DisableContinuityAccountAPIToken(userID, tokenID)
+	if err != nil {
+		return accountAPITokenDisableResult{}, err
+	}
+	return accountAPITokenDisableResult{
+		TokenID: tokenID,
+		UserID:  userID,
+		Changed: changed,
+	}, nil
 }
 
 func listRoutingGroups() ([]ContinuityRoutingGroup, error) {
