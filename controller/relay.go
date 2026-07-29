@@ -327,7 +327,22 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
-		return false
+		// Affinity normally keeps one session on the same provider so prompt
+		// caches remain reusable. A capacity 429 is different: keeping the
+		// failed affinity guarantees an avoidable outage even when another
+		// channel can serve the request. Release only this retryable capacity
+		// failure, then let the ordinary retry policy select another channel.
+		if openaiErr.StatusCode != http.StatusTooManyRequests ||
+			retryTimes <= 0 ||
+			types.IsSkipRetryError(openaiErr) ||
+			operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) ||
+			!operation_setting.ShouldRetryByStatusCode(openaiErr.StatusCode) {
+			return false
+		}
+		if _, ok := c.Get("specific_channel_id"); ok {
+			return false
+		}
+		service.ClearCurrentChannelAffinityCache(c)
 	}
 	if types.IsChannelError(openaiErr) {
 		return true
