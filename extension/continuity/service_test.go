@@ -1,6 +1,7 @@
 package continuity
 
 import (
+	"container/list"
 	"fmt"
 	"strings"
 	"testing"
@@ -26,6 +27,14 @@ func setupContinuityManagedGroupServiceTest(t *testing.T) *gorm.DB {
 	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
 	originalUserUsableGroups := setting.UserUsableGroups2JSONString()
 	originalSpecialUsableGroups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup.ReadAll()
+	continuityRecentRelaySuccesses.Lock()
+	originalRecentRelaySuccesses := continuityRecentRelaySuccesses.byPair
+	originalRecentRelaySuccessOrder := continuityRecentRelaySuccesses.order
+	originalRecentRelaySuccessCleanup := continuityRecentRelaySuccesses.lastCleanupAt
+	continuityRecentRelaySuccesses.byPair = make(map[string]*continuityRecentRelaySuccessEntry)
+	continuityRecentRelaySuccesses.order = list.New()
+	continuityRecentRelaySuccesses.lastCleanupAt = 0
+	continuityRecentRelaySuccesses.Unlock()
 	common.OptionMapRWMutex.Lock()
 	originalOptionMap := common.OptionMap
 	common.OptionMap = make(map[string]string)
@@ -47,6 +56,11 @@ func setupContinuityManagedGroupServiceTest(t *testing.T) *gorm.DB {
 		specialGroups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
 		specialGroups.Clear()
 		specialGroups.AddAll(originalSpecialUsableGroups)
+		continuityRecentRelaySuccesses.Lock()
+		continuityRecentRelaySuccesses.byPair = originalRecentRelaySuccesses
+		continuityRecentRelaySuccesses.order = originalRecentRelaySuccessOrder
+		continuityRecentRelaySuccesses.lastCleanupAt = originalRecentRelaySuccessCleanup
+		continuityRecentRelaySuccesses.Unlock()
 		common.OptionMapRWMutex.Lock()
 		common.OptionMap = originalOptionMap
 		common.OptionMapRWMutex.Unlock()

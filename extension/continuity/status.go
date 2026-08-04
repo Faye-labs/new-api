@@ -15,6 +15,7 @@ const (
 	continuityStatusHistoryIntervalSeconds  = int64(20 * 60)
 	continuityStatusHistoryPointLimit       = 72
 	continuityStatusHistoryTaskLimit        = 2048
+	continuityStatusMaxLatencyMs            = int64(time.Hour / time.Millisecond)
 
 	continuityModelStatusOperational = "operational"
 	continuityModelStatusDegraded    = "degraded"
@@ -23,6 +24,7 @@ const (
 
 	continuityStatusSourceNone           = "none"
 	continuityStatusSourcePassiveTraffic = "passive_traffic"
+	continuityStatusSourceRealTraffic    = "real_traffic"
 	continuityStatusSourceActiveProbe    = "active_probe"
 )
 
@@ -70,6 +72,7 @@ type continuityGroupModelStatusHistoryPoint struct {
 
 type continuityGroupModelStatusEvidence struct {
 	Passive     *continuityPassiveTrafficEvidence `json:"passive"`
+	RealTraffic *continuityRealTrafficEvidence    `json:"real_traffic"`
 	ActiveProbe *continuityActiveProbeEvidence    `json:"active_probe"`
 }
 
@@ -85,6 +88,11 @@ type continuityActiveProbeEvidence struct {
 	Status    string `json:"status"`
 	CheckedAt int64  `json:"checked_at"`
 	LatencyMs int64  `json:"latency_ms"`
+}
+
+type continuityRealTrafficEvidence struct {
+	ObservedAt int64 `json:"observed_at"`
+	LatencyMs  int64 `json:"latency_ms"`
 }
 
 func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot, error) {
@@ -158,6 +166,27 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 	if err != nil {
 		return continuityGroupModelStatusSnapshot{}, err
 	}
+	realTrafficMaxAge := continuityGroupModelRecentSuccessWindow
+	recentTrafficByPair, err := latestPersistedContinuityRealTrafficEvidence(now, realTrafficMaxAge)
+	if err != nil {
+		return continuityGroupModelStatusSnapshot{}, err
+	}
+	for groupKey, models := range groupModels {
+		for modelID := range models {
+			if evidence, ok := latestContinuityRecentRelaySuccess(
+				groupKey,
+				modelID,
+				now,
+				realTrafficMaxAge,
+			); ok {
+				pairKey := continuityGroupModelProbePairKey(groupKey, modelID)
+				persisted, exists := recentTrafficByPair[pairKey]
+				if !exists || evidence.ObservedAt >= persisted.ObservedAt {
+					recentTrafficByPair[pairKey] = evidence
+				}
+			}
+		}
+	}
 	historyByPair, historyWindowStart, historyWindowEnd, err :=
 		continuityGroupModelProbeHistory(now)
 	if err != nil {
@@ -205,6 +234,7 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 				},
 				Evidence: continuityGroupModelStatusEvidence{
 					Passive:     nil,
+					RealTraffic: nil,
 					ActiveProbe: nil,
 				},
 			}
@@ -213,7 +243,7 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 			if observed && len(passive.Series) > 0 {
 				latestBucketAt := passive.Series[len(passive.Series)-1].Ts
 				successRate := passive.SuccessRate
-				latencyMs := passive.AvgLatencyMs
+				latencyMs := continuityStatusLatencyMs(passive.AvgLatencyMs)
 
 				state.Status = continuityModelStatusDegraded
 				if successRate >= 100 {
@@ -233,10 +263,11 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 
 			active, activelyChecked := activeByPair[pairKey]
 			if activelyChecked {
+				activeLatencyMs := continuityStatusLatencyMs(active.LatencyMs)
 				state.Evidence.ActiveProbe = &continuityActiveProbeEvidence{
 					Status:    active.Status,
 					CheckedAt: active.CheckedAt,
-					LatencyMs: active.LatencyMs,
+					LatencyMs: activeLatencyMs,
 				}
 				passiveMayBeNewer := false
 				if state.Evidence.Passive != nil {
@@ -254,13 +285,30 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 					state.StatusSource = continuityStatusSourceActiveProbe
 					state.LastCheckedAt = &active.CheckedAt
 					state.LatencyMs = nil
-					if active.LatencyMs > 0 {
-						state.LatencyMs = &active.LatencyMs
+					if activeLatencyMs > 0 {
+						state.LatencyMs = &activeLatencyMs
 					}
 				} else if active.Status == continuityModelStatusUnknown &&
 					state.StatusSource == continuityStatusSourceNone {
 					state.StatusSource = continuityStatusSourceActiveProbe
 					state.LastCheckedAt = &active.CheckedAt
+				}
+			}
+
+			if traffic, observed := recentTrafficByPair[pairKey]; observed {
+				trafficLatencyMs := continuityStatusLatencyMs(traffic.LatencyMs)
+				state.Evidence.RealTraffic = &continuityRealTrafficEvidence{
+					ObservedAt: traffic.ObservedAt,
+					LatencyMs:  trafficLatencyMs,
+				}
+				realTrafficIsCurrent := !activelyChecked ||
+					active.Status == continuityModelStatusUnknown ||
+					traffic.ObservedAt >= active.CheckedAt
+				if realTrafficIsCurrent {
+					state.Status = continuityModelStatusOperational
+					state.StatusSource = continuityStatusSourceRealTraffic
+					state.LastCheckedAt = &traffic.ObservedAt
+					state.LatencyMs = &trafficLatencyMs
 				}
 			}
 			group.Models = append(group.Models, state)
@@ -332,7 +380,7 @@ func continuityGroupModelProbeHistory(
 				Status:    evidence.Status,
 			}
 			if evidence.LatencyMs > 0 {
-				latencyMs := evidence.LatencyMs
+				latencyMs := continuityStatusLatencyMs(evidence.LatencyMs)
 				point.LatencyMs = &latencyMs
 			}
 			bucketsByPair[pairKey][bucketIndex] = point
@@ -354,6 +402,16 @@ func continuityGroupModelProbeHistory(
 	}
 
 	return historyByPair, windowStart, windowEnd, nil
+}
+
+func continuityStatusLatencyMs(latencyMs int64) int64 {
+	if latencyMs < 0 {
+		return 0
+	}
+	if latencyMs > continuityStatusMaxLatencyMs {
+		return continuityStatusMaxLatencyMs
+	}
+	return latencyMs
 }
 
 func continuityAggregateGroupStatus(models []continuityRoutingModelState) string {

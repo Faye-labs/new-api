@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -18,6 +19,23 @@ type testPlugin struct {
 type testRelayPlugin struct {
 	testPlugin
 	headerValue string
+}
+
+type testRelaySuccessPlugin struct {
+	testPlugin
+	events *[]RelaySuccessEvent
+}
+
+type testPanickingRelaySuccessPlugin struct {
+	testPlugin
+}
+
+func (testPanickingRelaySuccessPlugin) ObserveRelaySuccess(RelaySuccessEvent) {
+	panic("observer failure")
+}
+
+func (plugin testRelaySuccessPlugin) ObserveRelaySuccess(event RelaySuccessEvent) {
+	*plugin.events = append(*plugin.events, event)
 }
 
 func (plugin testRelayPlugin) RelayV1Middleware() gin.HandlerFunc {
@@ -106,4 +124,45 @@ func TestRelayV1MiddlewaresIncludeOnlyEnabledProviders(t *testing.T) {
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/relay", nil))
 	assert.Equal(t, http.StatusNoContent, response.Code)
 	assert.Equal(t, "enabled", response.Header().Get("X-Test-Relay-Plugin"))
+}
+
+func TestNotifyRelaySuccessIncludesOnlyEnabledObservers(t *testing.T) {
+	pluginRegistry.Lock()
+	originalPlugins := pluginRegistry.plugins
+	originalOrder := pluginRegistry.order
+	pluginRegistry.plugins = make(map[string]Plugin)
+	pluginRegistry.order = nil
+	pluginRegistry.Unlock()
+	t.Cleanup(func() {
+		pluginRegistry.Lock()
+		pluginRegistry.plugins = originalPlugins
+		pluginRegistry.order = originalOrder
+		pluginRegistry.Unlock()
+	})
+
+	disabledEvents := make([]RelaySuccessEvent, 0)
+	enabledEvents := make([]RelaySuccessEvent, 0)
+	Register(testRelaySuccessPlugin{
+		testPlugin: testPlugin{name: "disabled-observer"},
+		events:     &disabledEvents,
+	})
+	Register(testPlugin{name: "enabled-without-observer", enabled: true})
+	Register(testPanickingRelaySuccessPlugin{
+		testPlugin: testPlugin{name: "panicking-observer", enabled: true},
+	})
+	Register(testRelaySuccessPlugin{
+		testPlugin: testPlugin{name: "enabled-observer", enabled: true},
+		events:     &enabledEvents,
+	})
+
+	event := RelaySuccessEvent{
+		Group:      "standard",
+		Model:      "model-a",
+		ObservedAt: time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC),
+		LatencyMs:  125,
+	}
+	NotifyRelaySuccess(event)
+
+	assert.Empty(t, disabledEvents)
+	assert.Equal(t, []RelaySuccessEvent{event}, enabledEvents)
 }

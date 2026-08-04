@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/extension"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -223,6 +224,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			relayInfo.LastError = nil
+			extension.NotifyRelaySuccess(extension.RelaySuccessEvent{
+				Group:      relayInfo.UsingGroup,
+				Model:      relayInfo.OriginModelName,
+				ObservedAt: time.Now(),
+				LatencyMs:  time.Since(relayInfo.StartTime).Milliseconds(),
+			})
 			return
 		}
 

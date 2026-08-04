@@ -3,6 +3,7 @@ package extension
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -23,6 +24,23 @@ type Plugin interface {
 // /v1 relay routes, so disabled extensions do not enter the request chain.
 type RelayV1MiddlewareProvider interface {
 	RelayV1Middleware() gin.HandlerFunc
+}
+
+// RelaySuccessEvent is the privacy-minimal outcome emitted after a relay has
+// completed successfully. It intentionally contains no request, token, user,
+// channel credential, or response data.
+type RelaySuccessEvent struct {
+	Group      string
+	Model      string
+	ObservedAt time.Time
+	LatencyMs  int64
+}
+
+// RelaySuccessObserver is an optional data-plane observation seam for source
+// extensions. Observers must return quickly; notification happens inline with
+// the successful relay completion path.
+type RelaySuccessObserver interface {
+	ObserveRelaySuccess(event RelaySuccessEvent)
 }
 
 var pluginRegistry = struct {
@@ -84,4 +102,30 @@ func RelayV1Middlewares() []gin.HandlerFunc {
 		}
 	}
 	return middlewares
+}
+
+// NotifyRelaySuccess sends one sanitized successful relay outcome to enabled
+// source extensions in deterministic registration order.
+func NotifyRelaySuccess(event RelaySuccessEvent) {
+	pluginRegistry.RLock()
+	plugins := make([]Plugin, 0, len(pluginRegistry.order))
+	for _, name := range pluginRegistry.order {
+		plugins = append(plugins, pluginRegistry.plugins[name])
+	}
+	pluginRegistry.RUnlock()
+
+	for _, plugin := range plugins {
+		observer, ok := plugin.(RelaySuccessObserver)
+		if !ok || !plugin.Enabled() {
+			continue
+		}
+		notifyRelaySuccessObserver(observer, event)
+	}
+}
+
+func notifyRelaySuccessObserver(observer RelaySuccessObserver, event RelaySuccessEvent) {
+	defer func() {
+		_ = recover()
+	}()
+	observer.ObserveRelaySuccess(event)
 }

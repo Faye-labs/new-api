@@ -49,6 +49,15 @@ enable/disable logic.
 Keep that exported seam narrow when resolving upstream changes; the probe
 scheduler and status policy belong in `extension/continuity/`.
 
+Successful synchronous `/v1` relays also emit the generic, privacy-minimal
+`extension.RelaySuccessEvent` host seam. The event contains only the exact
+routing group, original model, completion time and latency; it contains no
+user, token, prompt, response or channel credential data. Continuity consumes
+that event into its own bounded, concurrency-safe recent-success index rather
+than reading precision from performance-metric buckets. Asynchronous task
+submission is not treated as completed-request evidence because provider
+acceptance does not prove the eventual task outcome.
+
 ## Compatibility contract
 
 `GET /internal/continuity/capabilities` is the versioned compatibility gate.
@@ -141,6 +150,28 @@ Active checks are scheduled every 20 minutes by default. Override the cadence
 with `CONTINUITY_GROUP_MODEL_PROBE_INTERVAL_MINUTES`, or disable scheduled
 checks with `CONTINUITY_GROUP_MODEL_PROBE_ENABLED=0`; manual checks remain
 available while the extension itself is enabled.
+
+Scheduled checks use successful user traffic as the primary health evidence.
+For each exact group/model pair, a success observed during the fixed preceding
+20-minute coverage window marks the pair operational with source
+`real_traffic` and prevents a provider probe. The scheduler rechecks exclusions
+and recent traffic before each fallback attempt and before failure confirmation
+so traffic that arrives during a long task can still avoid another paid call.
+The 20-minute traffic window is a status-policy constant; changing the
+scheduler cadence does not change it. Manual checks (`manual=true`) remain a
+forced diagnostic and call the provider even when recent traffic exists, while
+still honoring exact-pair exclusions.
+
+Recent-success memory is bounded to 4096 sanitized exact pairs, evicts the
+least recently updated pair at capacity, and removes stale entries
+periodically. It is intentionally single-process and is lost on restart, which
+matches the extension's current single-process coherency contract. Scheduled
+task results also persist traffic-covered evidence as a short-lived status
+fallback and preserve probe rotation. Check summaries expose
+`traffic_covered`, `probed`, and `provider_attempts`; `provider_attempts` is the
+actual number of `controller.ProbeChannel` calls and is the direct probe-cost
+counter. Older task results without an evidence source continue to decode as
+active-probe evidence.
 
 `single_process_population_fence_v1` means the fork prevents a DB read started
 before a managed mutation from repopulating stale data in the same NewAPI

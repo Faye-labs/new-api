@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/extension"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -134,6 +135,167 @@ func TestGroupModelStatusSnapshotReturnsExactConfiguredMatrixAndPassiveEvidence(
 	assert.Nil(t, beta.Models[0].LastCheckedAt)
 	assert.Nil(t, beta.Models[0].Evidence.Passive)
 	assert.Nil(t, beta.Models[0].Evidence.ActiveProbe)
+}
+
+func TestGroupModelStatusSnapshotClampsPassiveLatencyToGatewayContract(t *testing.T) {
+	database := setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, database.AutoMigrate(&model.PerfMetric{}))
+
+	now := time.Now().UTC().Truncate(time.Second)
+	recentBucket := now.Add(-time.Hour).Truncate(time.Hour).Unix()
+	require.NoError(t, database.Create(&model.Ability{
+		Group:     "standard",
+		Model:     "long-running-model",
+		ChannelId: 1,
+		Enabled:   true,
+	}).Error)
+	require.NoError(t, database.Create(&model.PerfMetric{
+		ModelName:      "long-running-model",
+		Group:          "standard",
+		BucketTs:       recentBucket,
+		RequestCount:   1,
+		SuccessCount:   1,
+		TotalLatencyMs: continuityStatusMaxLatencyMs + 1,
+	}).Error)
+
+	snapshot, err := groupModelStatusSnapshot(now)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Groups, 1)
+	require.Len(t, snapshot.Groups[0].Models, 1)
+	state := snapshot.Groups[0].Models[0]
+	require.NotNil(t, state.LatencyMs)
+	assert.Equal(t, continuityStatusMaxLatencyMs, *state.LatencyMs)
+	require.NotNil(t, state.Evidence.Passive)
+	assert.Equal(t, continuityStatusMaxLatencyMs, state.Evidence.Passive.AverageLatencyMs)
+}
+
+func TestGroupModelStatusSnapshotUsesExactRecentRelaySuccessImmediately(t *testing.T) {
+	database := setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, database.AutoMigrate(&model.PerfMetric{}))
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, database.Create(&model.Ability{
+		Group:     "standard",
+		Model:     "model-a",
+		ChannelId: 1,
+		Enabled:   true,
+	}).Error)
+	recordContinuityRecentRelaySuccess(extension.RelaySuccessEvent{
+		Group:      "standard",
+		Model:      "model-a",
+		ObservedAt: now.Add(-10 * time.Second),
+		LatencyMs:  125,
+	})
+
+	snapshot, err := groupModelStatusSnapshot(now)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Groups, 1)
+	require.Len(t, snapshot.Groups[0].Models, 1)
+	state := snapshot.Groups[0].Models[0]
+	assert.Equal(t, continuityModelStatusOperational, state.Status)
+	assert.Equal(t, continuityStatusSourceRealTraffic, state.StatusSource)
+	require.NotNil(t, state.Evidence.RealTraffic)
+	assert.Equal(t, now.Add(-10*time.Second).Unix(), state.Evidence.RealTraffic.ObservedAt)
+	assert.Nil(t, state.Evidence.Passive)
+}
+
+func TestGroupModelStatusSnapshotUsesPersistedTrafficCoveredTaskAfterStoreLoss(t *testing.T) {
+	database := setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, database.AutoMigrate(&model.PerfMetric{}))
+	now := time.Now().UTC().Truncate(time.Second)
+	observedAt := now.Add(-time.Minute).Unix()
+	require.NoError(t, database.Create(&model.Ability{
+		Group:     "standard",
+		Model:     "model-a",
+		ChannelId: 1,
+		Enabled:   true,
+	}).Error)
+	resultJSON, err := common.Marshal(continuityGroupModelProbeResult{
+		SchemaVersion: 1,
+		CheckedAt:     now.Unix(),
+		Pairs: []continuityGroupModelProbeEvidence{{
+			GroupKey:  "standard",
+			ModelID:   "model-a",
+			Status:    continuityModelStatusOperational,
+			Source:    continuityStatusSourceRealTraffic,
+			CheckedAt: observedAt,
+			LatencyMs: 140,
+		}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, database.Create(&model.SystemTask{
+		TaskID:    "systask_persisted_real_traffic",
+		Type:      continuityGroupModelProbeTaskType,
+		Status:    model.SystemTaskStatusSucceeded,
+		Result:    string(resultJSON),
+		UpdatedAt: now.Unix(),
+	}).Error)
+
+	snapshot, err := groupModelStatusSnapshot(now)
+	require.NoError(t, err)
+	state := snapshot.Groups[0].Models[0]
+	assert.Equal(t, continuityStatusSourceRealTraffic, state.StatusSource)
+	assert.Equal(t, continuityModelStatusOperational, state.Status)
+	require.NotNil(t, state.Evidence.RealTraffic)
+	assert.Equal(t, observedAt, state.Evidence.RealTraffic.ObservedAt)
+}
+
+func TestOlderRealTrafficDoesNotOverrideNewerManualProbeInsidePassiveBucket(t *testing.T) {
+	database := setupContinuityManagedGroupServiceTest(t)
+	require.NoError(t, database.AutoMigrate(&model.PerfMetric{}))
+	now := time.Now().UTC().Truncate(time.Second)
+	bucketSeconds := int64(perf_metrics_setting.GetBucketSeconds())
+	bucketStart := now.Unix() - now.Unix()%bucketSeconds
+	activeCheckedAt := now.Add(-time.Minute).Unix()
+	realObservedAt := now.Add(-2 * time.Minute)
+	require.NoError(t, database.Create(&model.Ability{
+		Group:     "standard",
+		Model:     "model-a",
+		ChannelId: 1,
+		Enabled:   true,
+	}).Error)
+	require.NoError(t, database.Create(&model.PerfMetric{
+		ModelName:      "model-a",
+		Group:          "standard",
+		BucketTs:       bucketStart,
+		RequestCount:   4,
+		SuccessCount:   3,
+		TotalLatencyMs: 400,
+	}).Error)
+	activeResultJSON, err := common.Marshal(continuityGroupModelProbeResult{
+		SchemaVersion: 1,
+		CheckedAt:     activeCheckedAt,
+		Pairs: []continuityGroupModelProbeEvidence{{
+			GroupKey:  "standard",
+			ModelID:   "model-a",
+			Status:    continuityModelStatusUnavailable,
+			Source:    continuityStatusSourceActiveProbe,
+			CheckedAt: activeCheckedAt,
+		}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, database.Create(&model.SystemTask{
+		TaskID:    "systask_newer_manual_probe",
+		Type:      continuityGroupModelProbeTaskType,
+		Status:    model.SystemTaskStatusSucceeded,
+		Result:    string(activeResultJSON),
+		UpdatedAt: activeCheckedAt,
+	}).Error)
+	recordContinuityRecentRelaySuccess(extension.RelaySuccessEvent{
+		Group:      "standard",
+		Model:      "model-a",
+		ObservedAt: realObservedAt,
+		LatencyMs:  100,
+	})
+
+	snapshot, err := groupModelStatusSnapshot(now)
+	require.NoError(t, err)
+	state := snapshot.Groups[0].Models[0]
+	assert.Equal(t, continuityStatusSourcePassiveTraffic, state.StatusSource)
+	assert.Equal(t, continuityModelStatusDegraded, state.Status)
+	require.NotNil(t, state.Evidence.RealTraffic)
+	assert.Equal(t, realObservedAt.Unix(), state.Evidence.RealTraffic.ObservedAt)
+	require.NotNil(t, state.Evidence.ActiveProbe)
+	assert.Equal(t, activeCheckedAt, state.Evidence.ActiveProbe.CheckedAt)
 }
 
 func TestGroupModelStatusSnapshotOmitsOnlyTheExactExcludedPairAndItsEvidence(t *testing.T) {

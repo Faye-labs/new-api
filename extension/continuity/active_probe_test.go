@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/controller"
+	"github.com/QuantumNous/new-api/extension"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
@@ -125,6 +126,180 @@ func TestContinuityGroupModelProbeMakesNoProviderCallsBeforeExclusionsInitialize
 	}
 }
 
+func TestScheduledProbeUsesRecentTrafficWithoutCallingProvider(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	createContinuityProbePair(t,
+		[]model.Channel{{Id: 1, Name: "provider", Key: "key-1", Status: common.ChannelStatusEnabled}},
+		[]model.Ability{{Group: "standard", Model: "model-a", ChannelId: 1, Enabled: true}},
+	)
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, _ string, _ string) controller.ChannelProbeResult {
+			t.Fatal("scheduled probe must not call provider for a traffic-covered pair")
+			return controller.ChannelProbeResult{}
+		},
+		func(_ context.Context, _ time.Duration) error { return nil },
+	)
+	recordContinuityRecentRelaySuccess(extension.RelaySuccessEvent{
+		Group:      "standard",
+		Model:      "model-a",
+		ObservedAt: continuityProbeNow().Add(-time.Minute),
+		LatencyMs:  125,
+	})
+
+	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Pairs, 1)
+	assert.Equal(t, continuityStatusSourceRealTraffic, result.Pairs[0].Source)
+	assert.Equal(t, continuityModelStatusOperational, result.Pairs[0].Status)
+	assert.False(t, result.Pairs[0].ProbeAttempted)
+	assert.Equal(t, continuityGroupModelProbeSummary{
+		Total:          1,
+		Operational:    1,
+		TrafficCovered: 1,
+	}, result.Summary)
+}
+
+func TestScheduledProbeMostlyUsesTrafficAndReducesProviderAttempts(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	createContinuityProbePair(t,
+		[]model.Channel{
+			{Id: 1, Name: "provider-a", Key: "key-1", Status: common.ChannelStatusEnabled},
+			{Id: 2, Name: "provider-b", Key: "key-2", Status: common.ChannelStatusEnabled},
+			{Id: 3, Name: "provider-c", Key: "key-3", Status: common.ChannelStatusEnabled},
+		},
+		[]model.Ability{
+			{Group: "standard", Model: "model-a", ChannelId: 1, Enabled: true},
+			{Group: "standard", Model: "model-b", ChannelId: 2, Enabled: true},
+			{Group: "standard", Model: "model-c", ChannelId: 3, Enabled: true},
+		},
+	)
+	probeCount := 0
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, _ string, _ string) controller.ChannelProbeResult {
+			probeCount++
+			return controller.ChannelProbeResult{Status: controller.ChannelProbeStatusSucceeded}
+		},
+		func(_ context.Context, _ time.Duration) error { return nil },
+	)
+	for _, modelID := range []string{"model-a", "model-b"} {
+		recordContinuityRecentRelaySuccess(extension.RelaySuccessEvent{
+			Group:      "standard",
+			Model:      modelID,
+			ObservedAt: continuityProbeNow().Add(-time.Minute),
+		})
+	}
+
+	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, probeCount, "two of three pairs should avoid a paid provider probe")
+	assert.Equal(t, 3, result.Summary.Total)
+	assert.Equal(t, 2, result.Summary.TrafficCovered)
+	assert.Equal(t, 1, result.Summary.Probed)
+	assert.Equal(t, 1, result.Summary.ProviderAttempts)
+}
+
+func TestManualProbeForcesProviderCallDespiteRecentTraffic(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	createContinuityProbePair(t,
+		[]model.Channel{{Id: 1, Name: "provider", Key: "key-1", Status: common.ChannelStatusEnabled}},
+		[]model.Ability{{Group: "standard", Model: "model-a", ChannelId: 1, Enabled: true}},
+	)
+	probeCount := 0
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, _ string, _ string) controller.ChannelProbeResult {
+			probeCount++
+			return controller.ChannelProbeResult{Status: controller.ChannelProbeStatusSucceeded, LatencyMs: 250}
+		},
+		func(_ context.Context, _ time.Duration) error { return nil },
+	)
+	recordContinuityRecentRelaySuccess(extension.RelaySuccessEvent{
+		Group:      "standard",
+		Model:      "model-a",
+		ObservedAt: continuityProbeNow().Add(-time.Minute),
+		LatencyMs:  125,
+	})
+
+	result, err := runContinuityGroupModelProbe(context.Background(), &model.SystemTask{
+		Payload: `{"manual":true}`,
+	}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, probeCount)
+	require.Len(t, result.Pairs, 1)
+	assert.Equal(t, continuityStatusSourceActiveProbe, result.Pairs[0].Source)
+	assert.True(t, result.Pairs[0].ProbeAttempted)
+	assert.Equal(t, continuityGroupModelProbeSummary{
+		Total:            1,
+		Operational:      1,
+		Probed:           1,
+		ProviderAttempts: 1,
+	}, result.Summary)
+}
+
+func TestScheduledProbeUsesFixedTwentyMinuteTrafficWindow(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	t.Setenv(continuityGroupModelProbeIntervalMinutesEnv, "60")
+	createContinuityProbePair(t,
+		[]model.Channel{{Id: 1, Name: "provider", Key: "key-1", Status: common.ChannelStatusEnabled}},
+		[]model.Ability{{Group: "standard", Model: "model-a", ChannelId: 1, Enabled: true}},
+	)
+	probeCount := 0
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, _ string, _ string) controller.ChannelProbeResult {
+			probeCount++
+			return controller.ChannelProbeResult{Status: controller.ChannelProbeStatusSucceeded}
+		},
+		func(_ context.Context, _ time.Duration) error { return nil },
+	)
+	recordContinuityRecentRelaySuccess(extension.RelaySuccessEvent{
+		Group:      "standard",
+		Model:      "model-a",
+		ObservedAt: continuityProbeNow().Add(-21 * time.Minute),
+	})
+
+	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, probeCount)
+	assert.Equal(t, 1, result.Summary.ProviderAttempts)
+	assert.Zero(t, result.Summary.TrafficCovered)
+}
+
+func TestScheduledProbeRechecksTrafficBeforeFallback(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	createContinuityProbePair(t,
+		[]model.Channel{
+			{Id: 1, Name: "first", Key: "key-1", Status: common.ChannelStatusEnabled},
+			{Id: 2, Name: "fallback", Key: "key-2", Status: common.ChannelStatusEnabled},
+		},
+		[]model.Ability{
+			{Group: "standard", Model: "model-a", ChannelId: 1, Enabled: true},
+			{Group: "standard", Model: "model-a", ChannelId: 2, Enabled: true},
+		},
+	)
+	probeCount := 0
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, _ string, _ string) controller.ChannelProbeResult {
+			probeCount++
+			recordContinuityRecentRelaySuccess(extension.RelaySuccessEvent{
+				Group:      "standard",
+				Model:      "model-a",
+				ObservedAt: continuityProbeNow(),
+				LatencyMs:  90,
+			})
+			return controller.ChannelProbeResult{Status: controller.ChannelProbeStatusFailed}
+		},
+		func(_ context.Context, _ time.Duration) error { return nil },
+	)
+
+	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, probeCount)
+	require.Len(t, result.Pairs, 1)
+	assert.Equal(t, continuityStatusSourceRealTraffic, result.Pairs[0].Source)
+	assert.True(t, result.Pairs[0].ProbeAttempted)
+	assert.Equal(t, 1, result.Summary.TrafficCovered)
+	assert.Equal(t, 1, result.Summary.Probed)
+}
+
 func TestContinuityGroupModelProbeStopsAtFirstSuccessAndMarksFallbackDegraded(t *testing.T) {
 	setupContinuityManagedGroupServiceTest(t)
 	priorityHigh := int64(10)
@@ -169,8 +344,10 @@ func TestContinuityGroupModelProbeStopsAtFirstSuccessAndMarksFallbackDegraded(t 
 	assert.Equal(t, int64(125), result.Pairs[0].LatencyMs)
 	assert.Equal(t, 1, result.Pairs[0].NextRotation)
 	assert.Equal(t, continuityGroupModelProbeSummary{
-		Total:    1,
-		Degraded: 1,
+		Total:            1,
+		Degraded:         1,
+		Probed:           1,
+		ProviderAttempts: 2,
 	}, result.Summary)
 }
 
@@ -319,7 +496,10 @@ func TestContinuityGroupModelProbeRechecksExclusionsBeforeEveryChannelAttempt(t 
 	require.NoError(t, err)
 	assert.Equal(t, 1, probeCount)
 	assert.Empty(t, result.Pairs)
-	assert.Equal(t, continuityGroupModelProbeSummary{}, result.Summary)
+	assert.Equal(t, continuityGroupModelProbeSummary{
+		Probed:           1,
+		ProviderAttempts: 1,
+	}, result.Summary)
 }
 
 func TestContinuityGroupModelProbeRotatesTopPriorityFirstChoiceAcrossRuns(t *testing.T) {
@@ -410,6 +590,42 @@ func TestContinuityGroupModelProbeRequiresSecondFullFailureBeforeUnavailable(t *
 	assert.Equal(t, "compress", result.Pairs[0].GroupKey)
 	assert.Equal(t, continuityModelStatusUnavailable, result.Pairs[0].Status)
 	assert.Equal(t, 1, result.Summary.Unavailable)
+}
+
+func TestScheduledProbeRechecksTrafficBeforeFailureConfirmation(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	createContinuityProbePair(t,
+		[]model.Channel{{Id: 1, Name: "provider", Key: "key-1", Status: common.ChannelStatusEnabled}},
+		[]model.Ability{{Group: "compress", Model: "model-a", ChannelId: 1, Enabled: true}},
+	)
+	probeCount := 0
+	waitCount := 0
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, _ string, _ string) controller.ChannelProbeResult {
+			probeCount++
+			return controller.ChannelProbeResult{Status: controller.ChannelProbeStatusFailed}
+		},
+		func(_ context.Context, _ time.Duration) error {
+			waitCount++
+			recordContinuityRecentRelaySuccess(extension.RelaySuccessEvent{
+				Group:      "compress",
+				Model:      "model-a",
+				ObservedAt: continuityProbeNow(),
+				LatencyMs:  80,
+			})
+			return nil
+		},
+	)
+
+	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, probeCount)
+	assert.Equal(t, 1, waitCount)
+	require.Len(t, result.Pairs, 1)
+	assert.Equal(t, continuityModelStatusOperational, result.Pairs[0].Status)
+	assert.Equal(t, continuityStatusSourceRealTraffic, result.Pairs[0].Source)
+	assert.Equal(t, 1, result.Summary.TrafficCovered)
+	assert.Equal(t, 1, result.Summary.Probed)
 }
 
 func TestContinuityGroupModelProbeLeavesUnsupportedPairUnknownWithoutConfirmation(t *testing.T) {

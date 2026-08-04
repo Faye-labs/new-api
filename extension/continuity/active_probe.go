@@ -24,6 +24,7 @@ const (
 	continuityGroupModelProbeIntervalMinutesEnv = "CONTINUITY_GROUP_MODEL_PROBE_INTERVAL_MINUTES"
 
 	continuityGroupModelProbeDefaultIntervalMinutes = 20
+	continuityGroupModelRecentSuccessWindow         = 20 * time.Minute
 	continuityGroupModelProbeManualCooldown         = 60 * time.Second
 	continuityGroupModelProbeConfirmationDelay      = 60 * time.Second
 	continuityGroupModelProbeEvidenceMaxAge         = 45 * time.Minute
@@ -44,20 +45,26 @@ type continuityGroupModelProbeResult struct {
 }
 
 type continuityGroupModelProbeSummary struct {
-	Total       int `json:"total"`
-	Operational int `json:"operational"`
-	Degraded    int `json:"degraded"`
-	Unavailable int `json:"unavailable"`
-	Unknown     int `json:"unknown"`
+	Total            int `json:"total"`
+	Operational      int `json:"operational"`
+	Degraded         int `json:"degraded"`
+	Unavailable      int `json:"unavailable"`
+	Unknown          int `json:"unknown"`
+	TrafficCovered   int `json:"traffic_covered,omitempty"`
+	Probed           int `json:"probed,omitempty"`
+	ProviderAttempts int `json:"provider_attempts,omitempty"`
 }
 
 type continuityGroupModelProbeEvidence struct {
-	GroupKey     string `json:"group_key"`
-	ModelID      string `json:"model_id"`
-	Status       string `json:"status"`
-	CheckedAt    int64  `json:"checked_at"`
-	LatencyMs    int64  `json:"latency_ms"`
-	NextRotation int    `json:"next_rotation"`
+	GroupKey         string `json:"group_key"`
+	ModelID          string `json:"model_id"`
+	Status           string `json:"status"`
+	Source           string `json:"source,omitempty"`
+	CheckedAt        int64  `json:"checked_at"`
+	LatencyMs        int64  `json:"latency_ms"`
+	NextRotation     int    `json:"next_rotation"`
+	ProbeAttempted   bool   `json:"probe_attempted,omitempty"`
+	ProviderAttempts int    `json:"provider_attempts,omitempty"`
 }
 
 type continuityGroupModelProbeTaskView struct {
@@ -77,17 +84,23 @@ type continuityGroupModelProbeCandidate struct {
 }
 
 type continuityGroupModelProbePair struct {
-	groupKey     string
-	modelID      string
-	candidates   []continuityGroupModelProbeCandidate
-	nextRotation int
+	groupKey         string
+	modelID          string
+	candidates       []continuityGroupModelProbeCandidate
+	nextRotation     int
+	probeAttempted   bool
+	providerAttempts int
 }
 
 type continuityGroupModelProbeRoundResult struct {
-	status       string
-	latencyMs    int64
-	checkedAt    int64
-	needsConfirm bool
+	status           string
+	latencyMs        int64
+	checkedAt        int64
+	needsConfirm     bool
+	source           string
+	probeAttempted   bool
+	trafficCovered   bool
+	providerAttempts int
 }
 
 var (
@@ -156,8 +169,18 @@ func runContinuityGroupModelProbe(
 	if err != nil {
 		return continuityGroupModelProbeResult{}, err
 	}
+	payload := continuityGroupModelProbePayload{}
+	if task != nil {
+		if err := task.DecodePayload(&payload); err != nil {
+			return continuityGroupModelProbeResult{}, err
+		}
+	}
+	allowTrafficCoverage := !payload.Manual
+	trafficCoverageMaxAge := continuityGroupModelRecentSuccessWindow
 
 	evidenceByPair := make(map[string]continuityGroupModelProbeEvidence, len(pairs))
+	probedPairs := make(map[string]struct{}, len(pairs))
+	providerAttemptsTotal := 0
 	needsConfirmation := make([]continuityGroupModelProbePair, 0)
 	processed := 0
 	total := len(pairs)
@@ -174,6 +197,41 @@ func runContinuityGroupModelProbe(
 		if previousEvidence, ok := previous[pairKey]; ok {
 			pair.nextRotation = previousEvidence.NextRotation
 		}
+		if allowTrafficCoverage {
+			excluded, err := isContinuityGroupModelProbePairExcluded(pair.groupKey, pair.modelID)
+			if err != nil {
+				return continuityGroupModelProbeResult{}, err
+			}
+			if excluded {
+				processed++
+				if report != nil {
+					report(processed, total)
+				}
+				continue
+			}
+			if traffic, ok := latestContinuityRecentRelaySuccess(
+				pair.groupKey,
+				pair.modelID,
+				continuityProbeNow(),
+				trafficCoverageMaxAge,
+			); ok {
+				evidenceByPair[pairKey] = continuityGroupModelProbeEvidence{
+					GroupKey:     pair.groupKey,
+					ModelID:      pair.modelID,
+					Status:       continuityModelStatusOperational,
+					Source:       continuityStatusSourceRealTraffic,
+					CheckedAt:    traffic.ObservedAt,
+					LatencyMs:    traffic.LatencyMs,
+					NextRotation: pair.nextRotation,
+				}
+				processed++
+				if report != nil {
+					report(processed, total)
+				}
+				continue
+			}
+		}
+		startingRotation := pair.nextRotation
 		orderedCandidates, nextRotation := rotateContinuityGroupModelProbeCandidates(
 			pair.candidates,
 			pair.nextRotation,
@@ -181,9 +239,18 @@ func runContinuityGroupModelProbe(
 		pair.candidates = orderedCandidates
 		pair.nextRotation = nextRotation
 
-		round, excluded, err := probeContinuityGroupModelPair(ctx, *pair)
+		round, excluded, err := probeContinuityGroupModelPair(
+			ctx,
+			*pair,
+			allowTrafficCoverage,
+			trafficCoverageMaxAge,
+		)
 		if err != nil {
 			return continuityGroupModelProbeResult{}, err
+		}
+		providerAttemptsTotal += round.providerAttempts
+		if round.probeAttempted {
+			probedPairs[pairKey] = struct{}{}
 		}
 		if err := ctx.Err(); err != nil {
 			return continuityGroupModelProbeResult{}, err
@@ -195,17 +262,25 @@ func runContinuityGroupModelProbe(
 			}
 			continue
 		}
+		if !round.probeAttempted {
+			pair.nextRotation = startingRotation
+		}
 		if round.needsConfirm {
+			pair.probeAttempted = round.probeAttempted
+			pair.providerAttempts = round.providerAttempts
 			needsConfirmation = append(needsConfirmation, *pair)
 			continue
 		}
 		evidenceByPair[pairKey] = continuityGroupModelProbeEvidence{
-			GroupKey:     pair.groupKey,
-			ModelID:      pair.modelID,
-			Status:       round.status,
-			CheckedAt:    round.checkedAt,
-			LatencyMs:    round.latencyMs,
-			NextRotation: pair.nextRotation,
+			GroupKey:         pair.groupKey,
+			ModelID:          pair.modelID,
+			Status:           round.status,
+			Source:           round.source,
+			CheckedAt:        round.checkedAt,
+			LatencyMs:        round.latencyMs,
+			NextRotation:     pair.nextRotation,
+			ProbeAttempted:   round.probeAttempted,
+			ProviderAttempts: round.providerAttempts,
 		}
 		processed++
 		if report != nil {
@@ -222,9 +297,19 @@ func runContinuityGroupModelProbe(
 		if err := ctx.Err(); err != nil {
 			return continuityGroupModelProbeResult{}, err
 		}
-		round, excluded, err := probeContinuityGroupModelPair(ctx, pair)
+		pairKey := continuityGroupModelProbePairKey(pair.groupKey, pair.modelID)
+		round, excluded, err := probeContinuityGroupModelPair(
+			ctx,
+			pair,
+			allowTrafficCoverage,
+			trafficCoverageMaxAge,
+		)
 		if err != nil {
 			return continuityGroupModelProbeResult{}, err
+		}
+		providerAttemptsTotal += round.providerAttempts
+		if round.probeAttempted {
+			probedPairs[pairKey] = struct{}{}
 		}
 		if err := ctx.Err(); err != nil {
 			return continuityGroupModelProbeResult{}, err
@@ -236,7 +321,9 @@ func runContinuityGroupModelProbe(
 			}
 			continue
 		}
-		if round.needsConfirm {
+		if round.trafficCovered {
+			round.status = continuityModelStatusOperational
+		} else if round.needsConfirm {
 			round.status = continuityModelStatusUnavailable
 		} else if round.status == continuityModelStatusOperational ||
 			round.status == continuityModelStatusDegraded {
@@ -244,14 +331,16 @@ func runContinuityGroupModelProbe(
 			// confirmation remains degraded for this snapshot.
 			round.status = continuityModelStatusDegraded
 		}
-		pairKey := continuityGroupModelProbePairKey(pair.groupKey, pair.modelID)
 		evidenceByPair[pairKey] = continuityGroupModelProbeEvidence{
-			GroupKey:     pair.groupKey,
-			ModelID:      pair.modelID,
-			Status:       round.status,
-			CheckedAt:    round.checkedAt,
-			LatencyMs:    round.latencyMs,
-			NextRotation: pair.nextRotation,
+			GroupKey:         pair.groupKey,
+			ModelID:          pair.modelID,
+			Status:           round.status,
+			Source:           round.source,
+			CheckedAt:        round.checkedAt,
+			LatencyMs:        round.latencyMs,
+			NextRotation:     pair.nextRotation,
+			ProbeAttempted:   pair.probeAttempted || round.probeAttempted,
+			ProviderAttempts: pair.providerAttempts + round.providerAttempts,
 		}
 		processed++
 		if report != nil {
@@ -280,8 +369,13 @@ func runContinuityGroupModelProbe(
 		default:
 			result.Summary.Unknown++
 		}
+		if evidence.Source == continuityStatusSourceRealTraffic {
+			result.Summary.TrafficCovered++
+		}
 	}
 	result.Summary.Total = len(result.Pairs)
+	result.Summary.Probed = len(probedPairs)
+	result.Summary.ProviderAttempts = providerAttemptsTotal
 	if report != nil {
 		report(total, total)
 	}
@@ -401,9 +495,13 @@ func rotateContinuityGroupModelProbeCandidates(
 func probeContinuityGroupModelPair(
 	ctx context.Context,
 	pair continuityGroupModelProbePair,
+	allowTrafficCoverage bool,
+	trafficCoverageMaxAge time.Duration,
 ) (continuityGroupModelProbeRoundResult, bool, error) {
 	failed := 0
 	uncertain := 0
+	probeAttempted := false
+	providerAttempts := 0
 	for _, candidate := range pair.candidates {
 		excluded, err := isContinuityGroupModelProbePairExcluded(
 			pair.groupKey,
@@ -413,7 +511,28 @@ func probeContinuityGroupModelPair(
 			return continuityGroupModelProbeRoundResult{}, false, err
 		}
 		if excluded {
-			return continuityGroupModelProbeRoundResult{}, true, nil
+			return continuityGroupModelProbeRoundResult{
+				probeAttempted:   probeAttempted,
+				providerAttempts: providerAttempts,
+			}, true, nil
+		}
+		if allowTrafficCoverage {
+			if traffic, ok := latestContinuityRecentRelaySuccess(
+				pair.groupKey,
+				pair.modelID,
+				continuityProbeNow(),
+				trafficCoverageMaxAge,
+			); ok {
+				return continuityGroupModelProbeRoundResult{
+					status:           continuityModelStatusOperational,
+					latencyMs:        traffic.LatencyMs,
+					checkedAt:        traffic.ObservedAt,
+					source:           continuityStatusSourceRealTraffic,
+					probeAttempted:   probeAttempted,
+					trafficCovered:   true,
+					providerAttempts: providerAttempts,
+				}, false, nil
+			}
 		}
 		attemptContext, cancelAttempt := context.WithTimeout(
 			ctx,
@@ -425,6 +544,8 @@ func probeContinuityGroupModelPair(
 			pair.modelID,
 			pair.groupKey,
 		)
+		probeAttempted = true
+		providerAttempts++
 		cancelAttempt()
 		checkedAt := continuityProbeNow().UTC().Unix()
 		switch result.Status {
@@ -434,9 +555,12 @@ func probeContinuityGroupModelPair(
 				status = continuityModelStatusDegraded
 			}
 			return continuityGroupModelProbeRoundResult{
-				status:    status,
-				latencyMs: result.LatencyMs,
-				checkedAt: checkedAt,
+				status:           status,
+				latencyMs:        result.LatencyMs,
+				checkedAt:        checkedAt,
+				source:           continuityStatusSourceActiveProbe,
+				probeAttempted:   probeAttempted,
+				providerAttempts: providerAttempts,
 			}, false, nil
 		case controller.ChannelProbeStatusFailed:
 			failed++
@@ -446,8 +570,11 @@ func probeContinuityGroupModelPair(
 				continue
 			}
 			return continuityGroupModelProbeRoundResult{
-				status:    continuityModelStatusUnknown,
-				checkedAt: checkedAt,
+				status:           continuityModelStatusUnknown,
+				checkedAt:        checkedAt,
+				source:           continuityStatusSourceActiveProbe,
+				probeAttempted:   probeAttempted,
+				providerAttempts: providerAttempts,
 			}, false, nil
 		case controller.ChannelProbeStatusUnsupported,
 			controller.ChannelProbeStatusIndeterminate:
@@ -459,14 +586,20 @@ func probeContinuityGroupModelPair(
 	checkedAt := continuityProbeNow().UTC().Unix()
 	if failed == 0 || uncertain > 0 {
 		return continuityGroupModelProbeRoundResult{
-			status:    continuityModelStatusUnknown,
-			checkedAt: checkedAt,
+			status:           continuityModelStatusUnknown,
+			checkedAt:        checkedAt,
+			source:           continuityStatusSourceActiveProbe,
+			probeAttempted:   probeAttempted,
+			providerAttempts: providerAttempts,
 		}, false, nil
 	}
 	return continuityGroupModelProbeRoundResult{
-		status:       continuityModelStatusUnknown,
-		checkedAt:    checkedAt,
-		needsConfirm: true,
+		status:           continuityModelStatusUnknown,
+		checkedAt:        checkedAt,
+		needsConfirm:     true,
+		source:           continuityStatusSourceActiveProbe,
+		probeAttempted:   probeAttempted,
+		providerAttempts: providerAttempts,
 	}, false, nil
 }
 
@@ -541,10 +674,53 @@ func latestContinuityGroupModelProbeEvidence(
 	}
 	cutoff := now.UTC().Add(-continuityGroupModelProbeEvidenceMaxAge).Unix()
 	for _, evidence := range result.Pairs {
+		if evidence.Source != "" && evidence.Source != continuityStatusSourceActiveProbe {
+			continue
+		}
 		if evidence.CheckedAt < cutoff {
 			continue
 		}
 		evidenceByPair[continuityGroupModelProbePairKey(evidence.GroupKey, evidence.ModelID)] = evidence
+	}
+	return evidenceByPair, nil
+}
+
+func latestPersistedContinuityRealTrafficEvidence(
+	now time.Time,
+	maxAge time.Duration,
+) (map[string]continuityRecentRelaySuccess, error) {
+	evidenceByPair := make(map[string]continuityRecentRelaySuccess)
+	cutoff := now.UTC().Add(-maxAge).Unix()
+	var tasks []model.SystemTask
+	if err := model.DB.
+		Select("id", "result").
+		Where("type = ? AND status = ?", continuityGroupModelProbeTaskType, model.SystemTaskStatusSucceeded).
+		Where("updated_at >= ?", cutoff).
+		Order("id DESC").
+		Limit(continuityStatusHistoryTaskLimit).
+		Find(&tasks).Error; err != nil {
+		return nil, err
+	}
+	for _, task := range tasks {
+		result, err := decodeContinuityGroupModelProbeResult(task.Result)
+		if err != nil {
+			continue
+		}
+		for _, evidence := range result.Pairs {
+			if evidence.Source != continuityStatusSourceRealTraffic ||
+				evidence.CheckedAt < cutoff || evidence.CheckedAt > now.UTC().Unix() {
+				continue
+			}
+			pairKey := continuityGroupModelProbePairKey(evidence.GroupKey, evidence.ModelID)
+			current, exists := evidenceByPair[pairKey]
+			if exists && current.ObservedAt >= evidence.CheckedAt {
+				continue
+			}
+			evidenceByPair[pairKey] = continuityRecentRelaySuccess{
+				ObservedAt: evidence.CheckedAt,
+				LatencyMs:  evidence.LatencyMs,
+			}
+		}
 	}
 	return evidenceByPair, nil
 }
