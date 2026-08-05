@@ -424,10 +424,16 @@ func RequestTextToChatResponseFormat(raw json.RawMessage) (*dto.ResponseFormat, 
 }
 
 func responsesImagePartToChatImageURL(part map[string]any) any {
-	if imageURL, ok := part["image_url"]; ok {
-		return imageURL
-	}
 	imageURL := map[string]any{}
+	if existing, ok := part["image_url"]; ok {
+		if existingMap, ok := existing.(map[string]any); ok {
+			for key, value := range existingMap {
+				imageURL[key] = value
+			}
+		} else {
+			imageURL["url"] = existing
+		}
+	}
 	for _, key := range []string{"url", "file_id", "detail"} {
 		if value, ok := part[key]; ok {
 			imageURL[key] = value
