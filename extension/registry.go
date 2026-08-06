@@ -36,11 +36,29 @@ type RelaySuccessEvent struct {
 	LatencyMs  int64
 }
 
+// RelayOutcomeEvent is the privacy-minimal final result of one logical relay
+// request after retries. StatusRelevant is false for local validation/billing
+// rejections that did not test the selected group/model's serving path.
+type RelayOutcomeEvent struct {
+	Group          string
+	Model          string
+	ObservedAt     time.Time
+	LatencyMs      int64
+	Success        bool
+	StatusRelevant bool
+}
+
 // RelaySuccessObserver is an optional data-plane observation seam for source
 // extensions. Observers must return quickly; notification happens inline with
 // the successful relay completion path.
 type RelaySuccessObserver interface {
 	ObserveRelaySuccess(event RelaySuccessEvent)
+}
+
+// RelayOutcomeObserver receives both successful and failed final outcomes.
+// Observers must return quickly and must not retain user request data.
+type RelayOutcomeObserver interface {
+	ObserveRelayOutcome(event RelayOutcomeEvent)
 }
 
 var pluginRegistry = struct {
@@ -107,6 +125,20 @@ func RelayV1Middlewares() []gin.HandlerFunc {
 // NotifyRelaySuccess sends one sanitized successful relay outcome to enabled
 // source extensions in deterministic registration order.
 func NotifyRelaySuccess(event RelaySuccessEvent) {
+	NotifyRelayOutcome(RelayOutcomeEvent{
+		Group:          event.Group,
+		Model:          event.Model,
+		ObservedAt:     event.ObservedAt,
+		LatencyMs:      event.LatencyMs,
+		Success:        true,
+		StatusRelevant: true,
+	})
+}
+
+// NotifyRelayOutcome sends one sanitized final relay outcome to enabled source
+// extensions in deterministic registration order. Legacy success observers
+// continue to receive successful outcomes only.
+func NotifyRelayOutcome(event RelayOutcomeEvent) {
 	pluginRegistry.RLock()
 	plugins := make([]Plugin, 0, len(pluginRegistry.order))
 	for _, name := range pluginRegistry.order {
@@ -115,12 +147,30 @@ func NotifyRelaySuccess(event RelaySuccessEvent) {
 	pluginRegistry.RUnlock()
 
 	for _, plugin := range plugins {
-		observer, ok := plugin.(RelaySuccessObserver)
-		if !ok || !plugin.Enabled() {
+		if !plugin.Enabled() {
 			continue
 		}
-		notifyRelaySuccessObserver(observer, event)
+		if observer, ok := plugin.(RelayOutcomeObserver); ok {
+			notifyRelayOutcomeObserver(observer, event)
+		}
+		if event.Success {
+			if observer, ok := plugin.(RelaySuccessObserver); ok {
+				notifyRelaySuccessObserver(observer, RelaySuccessEvent{
+					Group:      event.Group,
+					Model:      event.Model,
+					ObservedAt: event.ObservedAt,
+					LatencyMs:  event.LatencyMs,
+				})
+			}
+		}
 	}
+}
+
+func notifyRelayOutcomeObserver(observer RelayOutcomeObserver, event RelayOutcomeEvent) {
+	defer func() {
+		_ = recover()
+	}()
+	observer.ObserveRelayOutcome(event)
 }
 
 func notifyRelaySuccessObserver(observer RelaySuccessObserver, event RelaySuccessEvent) {

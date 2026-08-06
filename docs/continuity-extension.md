@@ -49,14 +49,17 @@ enable/disable logic.
 Keep that exported seam narrow when resolving upstream changes; the probe
 scheduler and status policy belong in `extension/continuity/`.
 
-Successful synchronous `/v1` relays also emit the generic, privacy-minimal
-`extension.RelaySuccessEvent` host seam. The event contains only the exact
-routing group, original model, completion time and latency; it contains no
-user, token, prompt, response or channel credential data. Continuity consumes
-that event into its own bounded, concurrency-safe recent-success index rather
-than reading precision from performance-metric buckets. Asynchronous task
-submission is not treated as completed-request evidence because provider
-acceptance does not prove the eventual task outcome.
+Synchronous `/v1` relays emit one generic, privacy-minimal
+`extension.RelayOutcomeEvent` after the request's final retry result is known.
+The event contains only the exact routing group, original model, completion
+time, latency, success flag and whether the request reached a health-relevant
+routing stage; it contains no user, token, request id, prompt, response, error
+text or channel credential data. Continuity keeps an immediate bounded index
+and asynchronously persists per-minute aggregate counts. Local validation,
+billing and policy rejections are counted separately but do not mark an
+upstream pair unhealthy. Asynchronous task submission is not treated as a
+completed-request success because provider acceptance does not prove the
+eventual task outcome.
 
 ## Compatibility contract
 
@@ -153,21 +156,30 @@ available while the extension itself is enabled.
 
 Scheduled checks use successful user traffic as the primary health evidence.
 For each exact group/model pair, a success observed during the fixed preceding
-20-minute coverage window marks the pair operational with source
-`real_traffic` and prevents a provider probe. The scheduler rechecks exclusions
-and recent traffic before each fallback attempt and before failure confirmation
-so traffic that arrives during a long task can still avoid another paid call.
-The 20-minute traffic window is a status-policy constant; changing the
-scheduler cadence does not change it. Manual checks (`manual=true`) remain a
-forced diagnostic and call the provider even when recent traffic exists, while
-still honoring exact-pair exclusions.
+20-minute coverage window prevents a provider probe. This 20-minute coverage
+rule and the scheduled probe cadence remain independent from the live
+user-traffic health scan. The live scan is red when at least one relevant
+failure occurred in the preceding five minutes and no success occurred in the
+preceding minute; it is yellow when both conditions are present, and a recent
+success without a five-minute failure is green. Stream outcomes such as
+`client_gone`, timeout, scanner error, panic, ping failure or a recorded soft
+stream error are failures even when an adapter returned no Go error. The
+scheduler rechecks exclusions and recent successful traffic before each
+fallback attempt and before failure confirmation so traffic that arrives during
+a long task can still avoid another paid call. Manual checks (`manual=true`)
+remain a forced diagnostic and call the provider even when recent traffic
+exists, while still honoring exact-pair exclusions.
 
-Recent-success memory is bounded to 4096 sanitized exact pairs, evicts the
+Recent-outcome memory is bounded to 4096 sanitized exact pairs, evicts the
 least recently updated pair at capacity, and removes stale entries
-periodically. It is intentionally single-process and is lost on restart, which
-matches the extension's current single-process coherency contract. Scheduled
-task results also persist traffic-covered evidence as a short-lived status
-fallback and preserve probe rotation. Check summaries expose
+periodically. Per-minute aggregate rows retain all success, relevant-failure
+and ignored-local-failure counts for 48 hours without retaining user data.
+Signal history pre-aggregates those rows into its existing 20-minute cells:
+success-only is green, failure-only is red, and mixed traffic is yellow. A
+traffic cell takes precedence over an automatic-probe point in the same cell;
+the probe remains the fallback for traffic-idle cells. Scheduled task results
+also persist traffic-covered evidence as a short-lived compatibility fallback
+and preserve probe rotation. Check summaries expose
 `traffic_covered`, `probed`, and `provider_attempts`; `provider_attempts` is the
 actual number of `controller.ProbeChannel` calls and is the direct probe-cost
 counter. Older task results without an evidence source continue to decode as

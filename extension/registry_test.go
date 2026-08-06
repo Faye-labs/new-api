@@ -30,12 +30,29 @@ type testPanickingRelaySuccessPlugin struct {
 	testPlugin
 }
 
+type testRelayOutcomePlugin struct {
+	testPlugin
+	events *[]RelayOutcomeEvent
+}
+
+type testPanickingRelayOutcomePlugin struct {
+	testPlugin
+}
+
 func (testPanickingRelaySuccessPlugin) ObserveRelaySuccess(RelaySuccessEvent) {
 	panic("observer failure")
 }
 
 func (plugin testRelaySuccessPlugin) ObserveRelaySuccess(event RelaySuccessEvent) {
 	*plugin.events = append(*plugin.events, event)
+}
+
+func (plugin testRelayOutcomePlugin) ObserveRelayOutcome(event RelayOutcomeEvent) {
+	*plugin.events = append(*plugin.events, event)
+}
+
+func (testPanickingRelayOutcomePlugin) ObserveRelayOutcome(RelayOutcomeEvent) {
+	panic("observer failure")
 }
 
 func (plugin testRelayPlugin) RelayV1Middleware() gin.HandlerFunc {
@@ -165,4 +182,46 @@ func TestNotifyRelaySuccessIncludesOnlyEnabledObservers(t *testing.T) {
 
 	assert.Empty(t, disabledEvents)
 	assert.Equal(t, []RelaySuccessEvent{event}, enabledEvents)
+}
+
+func TestNotifyRelayOutcomeIncludesFailuresAndIsolatesObservers(t *testing.T) {
+	pluginRegistry.Lock()
+	originalPlugins := pluginRegistry.plugins
+	originalOrder := pluginRegistry.order
+	pluginRegistry.plugins = make(map[string]Plugin)
+	pluginRegistry.order = nil
+	pluginRegistry.Unlock()
+	t.Cleanup(func() {
+		pluginRegistry.Lock()
+		pluginRegistry.plugins = originalPlugins
+		pluginRegistry.order = originalOrder
+		pluginRegistry.Unlock()
+	})
+
+	disabledEvents := make([]RelayOutcomeEvent, 0)
+	enabledEvents := make([]RelayOutcomeEvent, 0)
+	Register(testRelayOutcomePlugin{
+		testPlugin: testPlugin{name: "disabled-outcome-observer"},
+		events:     &disabledEvents,
+	})
+	Register(testPanickingRelayOutcomePlugin{
+		testPlugin: testPlugin{name: "panicking-outcome-observer", enabled: true},
+	})
+	Register(testRelayOutcomePlugin{
+		testPlugin: testPlugin{name: "enabled-outcome-observer", enabled: true},
+		events:     &enabledEvents,
+	})
+
+	event := RelayOutcomeEvent{
+		Group:          "standard",
+		Model:          "model-a",
+		ObservedAt:     time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC),
+		LatencyMs:      125,
+		Success:        false,
+		StatusRelevant: true,
+	}
+	NotifyRelayOutcome(event)
+
+	assert.Empty(t, disabledEvents)
+	assert.Equal(t, []RelayOutcomeEvent{event}, enabledEvents)
 }

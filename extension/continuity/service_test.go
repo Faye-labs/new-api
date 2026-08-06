@@ -77,6 +77,7 @@ func setupContinuityManagedGroupServiceTest(t *testing.T) *gorm.DB {
 		&model.Option{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
+		&model.ContinuityRelayOutcomeBucket{},
 	))
 	return database
 }

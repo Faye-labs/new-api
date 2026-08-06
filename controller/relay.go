@@ -123,6 +123,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
 	}
+	statusRelevant := false
+	defer func() {
+		extension.NotifyRelayOutcome(extension.RelayOutcomeEvent{
+			Group:          relayInfo.UsingGroup,
+			Model:          relayInfo.OriginModelName,
+			ObservedAt:     time.Now(),
+			LatencyMs:      time.Since(relayInfo.StartTime).Milliseconds(),
+			Success:        statusRelevant && relayOutcomeSucceeded(c, relayInfo, newAPIError),
+			StatusRelevant: statusRelevant,
+		})
+	}()
 
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	needCountToken := constant.CountToken
@@ -188,6 +199,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	statusRelevant = true
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
@@ -224,12 +236,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			relayInfo.LastError = nil
-			extension.NotifyRelaySuccess(extension.RelaySuccessEvent{
-				Group:      relayInfo.UsingGroup,
-				Model:      relayInfo.OriginModelName,
-				ObservedAt: time.Now(),
-				LatencyMs:  time.Since(relayInfo.StartTime).Milliseconds(),
-			})
 			return
 		}
 
@@ -253,6 +259,23 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			perfmetrics.RecordRelaySample(relayInfo, false, 0)
 		})
 	}
+}
+
+func relayOutcomeSucceeded(
+	c *gin.Context,
+	relayInfo *relaycommon.RelayInfo,
+	newAPIError *types.NewAPIError,
+) bool {
+	if newAPIError != nil || relayInfo == nil || !relayInfo.FinalOutcomeSucceeded() {
+		return false
+	}
+	if c == nil {
+		return true
+	}
+	if c.Request != nil && c.Request.Context().Err() != nil {
+		return false
+	}
+	return c.Writer == nil || c.Writer.Status() < http.StatusBadRequest
 }
 
 var upgrader = websocket.Upgrader{

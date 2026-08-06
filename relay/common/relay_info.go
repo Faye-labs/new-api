@@ -150,6 +150,7 @@ type RelayInfo struct {
 	IsChannelTest                         bool // channel test request
 	RetryIndex                            int
 	LastError                             *types.NewAPIError
+	FinalOutcomeFailed                    bool
 	RuntimeHeadersOverride                map[string]interface{}
 	UseRuntimeHeadersOverride             bool
 	ParamOverrideAudit                    []string
@@ -191,6 +192,27 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+}
+
+// MarkFinalOutcomeFailed records a failure that was already written to the
+// client or stream status and therefore may not be returned as NewAPIError.
+func (info *RelayInfo) MarkFinalOutcomeFailed() {
+	if info != nil {
+		info.FinalOutcomeFailed = true
+	}
+}
+
+// FinalOutcomeSucceeded classifies the completed relay independently from its
+// billing/logging result. A nil StreamStatus preserves legacy non-stream and
+// adapter-specific success behavior.
+func (info *RelayInfo) FinalOutcomeSucceeded() bool {
+	if info == nil || info.FinalOutcomeFailed {
+		return false
+	}
+	if info.StreamStatus == nil {
+		return true
+	}
+	return info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors()
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {

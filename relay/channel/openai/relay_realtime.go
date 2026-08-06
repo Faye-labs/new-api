@@ -22,6 +22,7 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	}
 
 	info.IsStream = true
+	info.StreamStatus = relaycommon.NewStreamStatus()
 	clientConn := info.ClientWs
 	targetConn := info.TargetWs
 
@@ -48,7 +49,11 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 			default:
 				_, message, err := clientConn.ReadMessage()
 				if err != nil {
-					if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
+					} else {
+						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+						info.StreamStatus.RecordError(err.Error())
 						errChan <- fmt.Errorf("error reading from client: %v", err)
 					}
 					close(clientClosed)
@@ -204,10 +209,13 @@ func OpenaiRealtimeHandler(c *gin.Context, info *relaycommon.RelayInfo) (*types.
 	select {
 	case <-clientClosed:
 	case <-targetClosed:
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	case err := <-errChan:
-		//return service.OpenAIErrorWrapper(err, "realtime_error", http.StatusInternalServerError), nil
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, err)
+		info.StreamStatus.RecordError(err.Error())
 		logger.LogError(c, "realtime error: "+err.Error())
 	case <-c.Done():
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Err())
 	}
 
 	if usage.TotalTokens != 0 {

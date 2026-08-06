@@ -187,11 +187,24 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 			}
 		}
 	}
+	relayOutcomesByPair, err := loadContinuityRelayOutcomeEvidence(
+		windowStart.Unix(),
+		now.Unix(),
+	)
+	if err != nil {
+		return continuityGroupModelStatusSnapshot{}, err
+	}
 	historyByPair, historyWindowStart, historyWindowEnd, err :=
 		continuityGroupModelProbeHistory(now)
 	if err != nil {
 		return continuityGroupModelStatusSnapshot{}, err
 	}
+	historyByPair = mergeContinuityRelayOutcomeHistory(
+		historyByPair,
+		relayOutcomesByPair,
+		historyWindowStart,
+		historyWindowEnd,
+	)
 
 	groupKeys := make([]string, 0, len(groupModels))
 	for groupKey := range groupModels {
@@ -309,6 +322,26 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 					state.StatusSource = continuityStatusSourceRealTraffic
 					state.LastCheckedAt = &traffic.ObservedAt
 					state.LatencyMs = &trafficLatencyMs
+				}
+			}
+
+			if trafficStatus, checkedAt, latencyMs, observed :=
+				continuityCurrentUserTrafficStatus(relayOutcomesByPair[pairKey], now); observed {
+				trafficOverrides := trafficStatus != continuityModelStatusOperational ||
+					!activelyChecked || checkedAt >= active.CheckedAt
+				if trafficOverrides {
+					state.Status = trafficStatus
+					state.StatusSource = continuityStatusSourceRealTraffic
+					state.LastCheckedAt = &checkedAt
+					state.LatencyMs = nil
+					if latencyMs > 0 {
+						latency := continuityStatusLatencyMs(latencyMs)
+						state.LatencyMs = &latency
+					}
+					state.Evidence.RealTraffic = &continuityRealTrafficEvidence{
+						ObservedAt: checkedAt,
+						LatencyMs:  continuityStatusLatencyMs(latencyMs),
+					}
 				}
 			}
 			group.Models = append(group.Models, state)
