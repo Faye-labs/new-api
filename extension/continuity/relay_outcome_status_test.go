@@ -126,6 +126,39 @@ func TestRelayTrafficHistoryOverridesProbeAndAggregatesEveryOutcome(t *testing.T
 	assert.Equal(t, continuityModelStatusUnavailable, merged[pairKey][2].Status)
 }
 
+func TestRelayTrafficHistoryBucketsByObservedTimeAcrossShiftedWindowBoundary(t *testing.T) {
+	windowStart := time.Date(2030, time.January, 1, 12, 0, 30, 0, time.UTC).Unix()
+	windowEnd := windowStart + int64(24*time.Hour/time.Second)
+	pairKey := continuityGroupModelProbePairKey("standard", "model-a")
+	probeCheckedAt := windowStart + continuityStatusHistoryIntervalSeconds + 5
+	trafficCheckedAt := probeCheckedAt + 5
+	history := map[string][]continuityGroupModelStatusHistoryPoint{
+		pairKey: {
+			{
+				CheckedAt: probeCheckedAt,
+				Status:    continuityModelStatusUnavailable,
+			},
+		},
+	}
+	outcomes := map[string]*continuityRelayOutcomePairEvidence{
+		pairKey: {
+			Buckets: []model.ContinuityRelayOutcomeBucket{
+				{
+					BucketTs:            windowStart + continuityStatusHistoryIntervalSeconds - 30,
+					SuccessCount:        1,
+					SuccessLatencySumMs: 120,
+					LatestSuccessAt:     trafficCheckedAt,
+				},
+			},
+		},
+	}
+
+	merged := mergeContinuityRelayOutcomeHistory(history, outcomes, windowStart, windowEnd)
+	require.Len(t, merged[pairKey], 1)
+	assert.Equal(t, trafficCheckedAt, merged[pairKey][0].CheckedAt)
+	assert.Equal(t, continuityModelStatusOperational, merged[pairKey][0].Status)
+}
+
 func TestContinuityRelayOutcomeBucketPersistsAllFinalCallsAndKeepsLatestTimes(t *testing.T) {
 	database := setupContinuityManagedGroupServiceTest(t)
 	bucketTs := time.Date(2030, time.January, 2, 12, 0, 0, 0, time.UTC).Unix()

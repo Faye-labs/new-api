@@ -189,19 +189,20 @@ func mergeContinuityRelayOutcomeHistory(
 				(row.SuccessCount <= 0 && row.FailureCount <= 0) {
 				continue
 			}
-			bucketIndex := int((row.BucketTs - windowStart) / continuityStatusHistoryIntervalSeconds)
-			if bucketIndex < 0 || bucketIndex >= continuityStatusHistoryPointLimit {
+			checkedAt := row.LatestSuccessAt
+			if row.LatestFailureAt > checkedAt {
+				checkedAt = row.LatestFailureAt
+			}
+			bucketIndex := continuityStatusHistoryBucketIndex(checkedAt, windowStart, windowEnd)
+			if bucketIndex < 0 {
 				continue
 			}
 			aggregate := trafficByBucket[bucketIndex]
 			aggregate.successCount += row.SuccessCount
 			aggregate.failureCount += row.FailureCount
 			aggregate.latencySumMs += row.SuccessLatencySumMs
-			if row.LatestSuccessAt > aggregate.checkedAt {
-				aggregate.checkedAt = row.LatestSuccessAt
-			}
-			if row.LatestFailureAt > aggregate.checkedAt {
-				aggregate.checkedAt = row.LatestFailureAt
+			if checkedAt > aggregate.checkedAt {
+				aggregate.checkedAt = checkedAt
 			}
 			trafficByBucket[bucketIndex] = aggregate
 		}
