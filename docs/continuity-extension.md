@@ -154,26 +154,23 @@ with `CONTINUITY_GROUP_MODEL_PROBE_INTERVAL_MINUTES`, or disable scheduled
 checks with `CONTINUITY_GROUP_MODEL_PROBE_ENABLED=0`; manual checks remain
 available while the extension itself is enabled.
 
-Scheduled checks use successful user traffic as the primary health evidence.
-For each exact group/model pair, a success observed during the fixed preceding
-20-minute coverage window prevents a provider probe. This 20-minute coverage
-rule and the scheduled probe cadence remain independent from the live
-user-traffic health scan. The live scan is red when at least one relevant
-failure occurred in the preceding five minutes and no success occurred in the
-preceding minute; it is yellow when both conditions are present, and a recent
-success without a five-minute failure is green. Stream outcomes such as
+Scheduled and manual checks use sanitized user traffic as the primary health
+evidence. For each exact group/model pair, all relevant final relay outcomes in
+the fixed preceding five-minute window form one free health sample: success-only
+is green, failure-only is red, and mixed success/failure is yellow. Any of these
+three observed states covers the pair for that task, so the task keeps its normal
+schedule but sends a paid provider probe only when the pair has no user-traffic
+evidence in the window. A successful active probe follows the same
+stop-at-first-success rule. Every fallback attempt and failure confirmation
+rechecks exclusions and current traffic, so evidence that arrives during a long
+task can still stop further provider calls. Stream outcomes such as
 `client_gone`, timeout, scanner error, panic, ping failure or a recorded soft
-stream error are failures even when an adapter returned no Go error. The
-scheduler rechecks exclusions and recent successful traffic before each
-fallback attempt and before failure confirmation so traffic that arrives during
-a long task can still avoid another paid call. Manual checks (`manual=true`)
-remain a forced diagnostic and call the provider even when recent traffic
-exists, while still honoring exact-pair exclusions.
+stream error are failures even when an adapter returned no Go error.
 
-Recent-outcome memory is bounded to 4096 sanitized exact pairs, evicts the
-least recently updated pair at capacity, and removes stale entries
-periodically. Per-minute aggregate rows retain all success, relevant-failure
-and ignored-local-failure counts for 48 hours without retaining user data.
+Recent-outcome memory is bounded to 4096 sanitized exact pairs, evicts the least
+recently updated pair at capacity, and removes stale entries periodically.
+Per-minute pair aggregates retain all success, relevant-failure and
+ignored-local-failure counts for 48 hours without retaining user data.
 Signal history pre-aggregates those rows into its existing 20-minute cells:
 success-only is green, failure-only is red, and mixed traffic is yellow. A
 traffic cell takes precedence over an automatic-probe point in the same cell;

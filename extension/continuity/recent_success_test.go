@@ -114,9 +114,40 @@ func TestRecentRelaySuccessStoreClampsLatencyToStatusContract(t *testing.T) {
 			"standard",
 			test.modelID,
 			now,
-			continuityGroupModelRecentSuccessWindow,
+			continuityUserTrafficWindow,
 		)
 		require.True(t, ok)
 		assert.Equal(t, test.expected, evidence.LatencyMs)
 	}
+}
+
+func TestRecentRelayOutcomeLoadsSuccessAndFailureFromPersistence(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, persistContinuityRelayOutcome(extension.RelayOutcomeEvent{
+		Group:          "standard",
+		Model:          "model-a",
+		ObservedAt:     now.Add(-4 * time.Minute),
+		LatencyMs:      125,
+		Success:        true,
+		StatusRelevant: true,
+	}))
+	require.NoError(t, persistContinuityRelayOutcome(extension.RelayOutcomeEvent{
+		Group:          "standard",
+		Model:          "model-a",
+		ObservedAt:     now.Add(-2 * time.Minute),
+		Success:        false,
+		StatusRelevant: true,
+	}))
+
+	evidence, ok := latestContinuityRecentRelayOutcome(
+		"standard",
+		"model-a",
+		now,
+		continuityUserTrafficWindow,
+	)
+	require.True(t, ok)
+	assert.Equal(t, now.Add(-4*time.Minute).Unix(), evidence.LatestSuccessAt)
+	assert.Equal(t, int64(125), evidence.LatestSuccessLatencyMs)
+	assert.Equal(t, now.Add(-2*time.Minute).Unix(), evidence.LatestFailureAt)
 }

@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCurrentUserTrafficStatusUsesIndependentFailureAndSuccessWindows(t *testing.T) {
+func TestCurrentUserTrafficStatusUsesOneFiveMinuteEvidenceWindow(t *testing.T) {
 	now := time.Date(2030, time.January, 2, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name     string
@@ -19,27 +19,25 @@ func TestCurrentUserTrafficStatusUsesIndependentFailureAndSuccessWindows(t *test
 		observed bool
 	}{
 		{
-			name: "failure in five minutes without success in one minute is red",
+			name: "failure only is red",
 			evidence: &continuityRelayOutcomePairEvidence{
 				LatestFailureAt: now.Add(-4 * time.Minute).Unix(),
-				LatestSuccessAt: now.Add(-90 * time.Second).Unix(),
 			},
 			status: continuityModelStatusUnavailable, observed: true,
 		},
 		{
-			name: "failure in five minutes with success in one minute is yellow",
+			name: "success and failure are yellow",
 			evidence: &continuityRelayOutcomePairEvidence{
 				LatestFailureAt:        now.Add(-4 * time.Minute).Unix(),
-				LatestSuccessAt:        now.Add(-30 * time.Second).Unix(),
+				LatestSuccessAt:        now.Add(-90 * time.Second).Unix(),
 				LatestSuccessLatencyMs: 125,
 			},
 			status: continuityModelStatusDegraded, observed: true,
 		},
 		{
-			name: "success in coverage window without recent failure is green",
+			name: "success only is green",
 			evidence: &continuityRelayOutcomePairEvidence{
-				LatestFailureAt:        now.Add(-6 * time.Minute).Unix(),
-				LatestSuccessAt:        now.Add(-19 * time.Minute).Unix(),
+				LatestSuccessAt:        now.Add(-4 * time.Minute).Unix(),
 				LatestSuccessLatencyMs: 250,
 			},
 			status: continuityModelStatusOperational, observed: true,
@@ -52,10 +50,10 @@ func TestCurrentUserTrafficStatusUsesIndependentFailureAndSuccessWindows(t *test
 			status: continuityModelStatusUnavailable, observed: true,
 		},
 		{
-			name: "success boundary is inclusive",
+			name: "success and failure boundary is inclusive",
 			evidence: &continuityRelayOutcomePairEvidence{
 				LatestFailureAt: now.Add(-5 * time.Minute).Unix(),
-				LatestSuccessAt: now.Add(-time.Minute).Unix(),
+				LatestSuccessAt: now.Add(-5 * time.Minute).Unix(),
 			},
 			status: continuityModelStatusDegraded, observed: true,
 		},
@@ -63,7 +61,7 @@ func TestCurrentUserTrafficStatusUsesIndependentFailureAndSuccessWindows(t *test
 			name: "stale traffic falls back",
 			evidence: &continuityRelayOutcomePairEvidence{
 				LatestFailureAt: now.Add(-6 * time.Minute).Unix(),
-				LatestSuccessAt: now.Add(-21 * time.Minute).Unix(),
+				LatestSuccessAt: now.Add(-6 * time.Minute).Unix(),
 			},
 			status: continuityModelStatusUnknown, observed: false,
 		},

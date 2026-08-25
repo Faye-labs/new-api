@@ -7,10 +7,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 )
 
-const (
-	continuityUserTrafficFailureWindow = 5 * time.Minute
-	continuityUserTrafficSuccessWindow = time.Minute
-)
+const continuityUserTrafficWindow = 5 * time.Minute
 
 type continuityRelayOutcomePairEvidence struct {
 	Buckets                []model.ContinuityRelayOutcomeBucket
@@ -135,26 +132,23 @@ func continuityCurrentUserTrafficStatus(
 		return continuityModelStatusUnknown, 0, 0, false
 	}
 	nowUnix := now.UTC().Unix()
-	failureCutoff := now.UTC().Add(-continuityUserTrafficFailureWindow).Unix()
-	successCutoff := now.UTC().Add(-continuityUserTrafficSuccessWindow).Unix()
-	coverageCutoff := now.UTC().Add(-continuityGroupModelRecentSuccessWindow).Unix()
-	failure5m := evidence.LatestFailureAt >= failureCutoff && evidence.LatestFailureAt <= nowUnix
-	success1m := evidence.LatestSuccessAt >= successCutoff && evidence.LatestSuccessAt <= nowUnix
-	success20m := evidence.LatestSuccessAt >= coverageCutoff && evidence.LatestSuccessAt <= nowUnix
-	if failure5m {
+	cutoff := now.UTC().Add(-continuityUserTrafficWindow).Unix()
+	failureObserved := evidence.LatestFailureAt >= cutoff && evidence.LatestFailureAt <= nowUnix
+	successObserved := evidence.LatestSuccessAt >= cutoff && evidence.LatestSuccessAt <= nowUnix
+	if failureObserved && successObserved {
 		checkedAt := evidence.LatestFailureAt
-		if success1m {
-			if evidence.LatestSuccessAt > checkedAt {
-				checkedAt = evidence.LatestSuccessAt
-			}
-			return continuityModelStatusDegraded,
-				checkedAt,
-				evidence.LatestSuccessLatencyMs,
-				true
+		if evidence.LatestSuccessAt > checkedAt {
+			checkedAt = evidence.LatestSuccessAt
 		}
-		return continuityModelStatusUnavailable, checkedAt, 0, true
+		return continuityModelStatusDegraded,
+			checkedAt,
+			evidence.LatestSuccessLatencyMs,
+			true
 	}
-	if success20m {
+	if failureObserved {
+		return continuityModelStatusUnavailable, evidence.LatestFailureAt, 0, true
+	}
+	if successObserved {
 		return continuityModelStatusOperational,
 			evidence.LatestSuccessAt,
 			evidence.LatestSuccessLatencyMs,

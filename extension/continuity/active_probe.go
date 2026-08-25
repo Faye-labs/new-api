@@ -24,7 +24,6 @@ const (
 	continuityGroupModelProbeIntervalMinutesEnv = "CONTINUITY_GROUP_MODEL_PROBE_INTERVAL_MINUTES"
 
 	continuityGroupModelProbeDefaultIntervalMinutes = 20
-	continuityGroupModelRecentSuccessWindow         = 20 * time.Minute
 	continuityGroupModelProbeManualCooldown         = 60 * time.Second
 	continuityGroupModelProbeConfirmationDelay      = 60 * time.Second
 	continuityGroupModelProbeEvidenceMaxAge         = 45 * time.Minute
@@ -175,8 +174,7 @@ func runContinuityGroupModelProbe(
 			return continuityGroupModelProbeResult{}, err
 		}
 	}
-	allowTrafficCoverage := !payload.Manual
-	trafficCoverageMaxAge := continuityGroupModelRecentSuccessWindow
+	trafficCoverageMaxAge := continuityUserTrafficWindow
 
 	evidenceByPair := make(map[string]continuityGroupModelProbeEvidence, len(pairs))
 	probedPairs := make(map[string]struct{}, len(pairs))
@@ -197,39 +195,36 @@ func runContinuityGroupModelProbe(
 		if previousEvidence, ok := previous[pairKey]; ok {
 			pair.nextRotation = previousEvidence.NextRotation
 		}
-		if allowTrafficCoverage {
-			excluded, err := isContinuityGroupModelProbePairExcluded(pair.groupKey, pair.modelID)
-			if err != nil {
-				return continuityGroupModelProbeResult{}, err
+		excluded, err := isContinuityGroupModelProbePairExcluded(pair.groupKey, pair.modelID)
+		if err != nil {
+			return continuityGroupModelProbeResult{}, err
+		}
+		if excluded {
+			processed++
+			if report != nil {
+				report(processed, total)
 			}
-			if excluded {
-				processed++
-				if report != nil {
-					report(processed, total)
-				}
-				continue
+			continue
+		}
+		if traffic, covered := currentContinuityGroupModelTraffic(
+			*pair,
+			continuityProbeNow(),
+			trafficCoverageMaxAge,
+		); covered {
+			evidenceByPair[pairKey] = continuityGroupModelProbeEvidence{
+				GroupKey:     pair.groupKey,
+				ModelID:      pair.modelID,
+				Status:       traffic.status,
+				Source:       traffic.source,
+				CheckedAt:    traffic.checkedAt,
+				LatencyMs:    traffic.latencyMs,
+				NextRotation: pair.nextRotation,
 			}
-			if traffic, ok := latestContinuityRecentRelaySuccess(
-				pair.groupKey,
-				pair.modelID,
-				continuityProbeNow(),
-				trafficCoverageMaxAge,
-			); ok {
-				evidenceByPair[pairKey] = continuityGroupModelProbeEvidence{
-					GroupKey:     pair.groupKey,
-					ModelID:      pair.modelID,
-					Status:       continuityModelStatusOperational,
-					Source:       continuityStatusSourceRealTraffic,
-					CheckedAt:    traffic.ObservedAt,
-					LatencyMs:    traffic.LatencyMs,
-					NextRotation: pair.nextRotation,
-				}
-				processed++
-				if report != nil {
-					report(processed, total)
-				}
-				continue
+			processed++
+			if report != nil {
+				report(processed, total)
 			}
+			continue
 		}
 		startingRotation := pair.nextRotation
 		orderedCandidates, nextRotation := rotateContinuityGroupModelProbeCandidates(
@@ -242,7 +237,6 @@ func runContinuityGroupModelProbe(
 		round, excluded, err := probeContinuityGroupModelPair(
 			ctx,
 			*pair,
-			allowTrafficCoverage,
 			trafficCoverageMaxAge,
 		)
 		if err != nil {
@@ -301,7 +295,6 @@ func runContinuityGroupModelProbe(
 		round, excluded, err := probeContinuityGroupModelPair(
 			ctx,
 			pair,
-			allowTrafficCoverage,
 			trafficCoverageMaxAge,
 		)
 		if err != nil {
@@ -321,12 +314,10 @@ func runContinuityGroupModelProbe(
 			}
 			continue
 		}
-		if round.trafficCovered {
-			round.status = continuityModelStatusOperational
-		} else if round.needsConfirm {
+		if round.needsConfirm {
 			round.status = continuityModelStatusUnavailable
-		} else if round.status == continuityModelStatusOperational ||
-			round.status == continuityModelStatusDegraded {
+		} else if !round.trafficCovered && (round.status == continuityModelStatusOperational ||
+			round.status == continuityModelStatusDegraded) {
 			// A pair that failed its entire first pass but recovered during
 			// confirmation remains degraded for this snapshot.
 			round.status = continuityModelStatusDegraded
@@ -495,7 +486,6 @@ func rotateContinuityGroupModelProbeCandidates(
 func probeContinuityGroupModelPair(
 	ctx context.Context,
 	pair continuityGroupModelProbePair,
-	allowTrafficCoverage bool,
 	trafficCoverageMaxAge time.Duration,
 ) (continuityGroupModelProbeRoundResult, bool, error) {
 	failed := 0
@@ -516,23 +506,16 @@ func probeContinuityGroupModelPair(
 				providerAttempts: providerAttempts,
 			}, true, nil
 		}
-		if allowTrafficCoverage {
-			if traffic, ok := latestContinuityRecentRelaySuccess(
-				pair.groupKey,
-				pair.modelID,
-				continuityProbeNow(),
-				trafficCoverageMaxAge,
-			); ok {
-				return continuityGroupModelProbeRoundResult{
-					status:           continuityModelStatusOperational,
-					latencyMs:        traffic.LatencyMs,
-					checkedAt:        traffic.ObservedAt,
-					source:           continuityStatusSourceRealTraffic,
-					probeAttempted:   probeAttempted,
-					trafficCovered:   true,
-					providerAttempts: providerAttempts,
-				}, false, nil
-			}
+		now := continuityProbeNow()
+		traffic, covered := currentContinuityGroupModelTraffic(
+			pair,
+			now,
+			trafficCoverageMaxAge,
+		)
+		if covered {
+			traffic.probeAttempted = probeAttempted
+			traffic.providerAttempts = providerAttempts
+			return traffic, false, nil
 		}
 		attemptContext, cancelAttempt := context.WithTimeout(
 			ctx,
@@ -601,6 +584,40 @@ func probeContinuityGroupModelPair(
 		probeAttempted:   probeAttempted,
 		providerAttempts: providerAttempts,
 	}, false, nil
+}
+
+func currentContinuityGroupModelTraffic(
+	pair continuityGroupModelProbePair,
+	now time.Time,
+	maxAge time.Duration,
+) (continuityGroupModelProbeRoundResult, bool) {
+	outcome, ok := latestContinuityRecentRelayOutcome(
+		pair.groupKey,
+		pair.modelID,
+		now,
+		maxAge,
+	)
+	if !ok {
+		return continuityGroupModelProbeRoundResult{}, false
+	}
+	status, checkedAt, latencyMs, observed := continuityCurrentUserTrafficStatus(
+		&continuityRelayOutcomePairEvidence{
+			LatestSuccessAt:        outcome.LatestSuccessAt,
+			LatestSuccessLatencyMs: outcome.LatestSuccessLatencyMs,
+			LatestFailureAt:        outcome.LatestFailureAt,
+		},
+		now,
+	)
+	if !observed {
+		return continuityGroupModelProbeRoundResult{}, false
+	}
+	return continuityGroupModelProbeRoundResult{
+		status:         status,
+		latencyMs:      latencyMs,
+		checkedAt:      checkedAt,
+		source:         continuityStatusSourceRealTraffic,
+		trafficCovered: true,
+	}, true
 }
 
 func isContinuityGroupModelProbePairExcluded(groupKey string, modelID string) (bool, error) {
@@ -708,6 +725,7 @@ func latestPersistedContinuityRealTrafficEvidence(
 		}
 		for _, evidence := range result.Pairs {
 			if evidence.Source != continuityStatusSourceRealTraffic ||
+				evidence.Status != continuityModelStatusOperational ||
 				evidence.CheckedAt < cutoff || evidence.CheckedAt > now.UTC().Unix() {
 				continue
 			}

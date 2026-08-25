@@ -166,7 +166,7 @@ func groupModelStatusSnapshot(now time.Time) (continuityGroupModelStatusSnapshot
 	if err != nil {
 		return continuityGroupModelStatusSnapshot{}, err
 	}
-	realTrafficMaxAge := continuityGroupModelRecentSuccessWindow
+	realTrafficMaxAge := continuityUserTrafficWindow
 	recentTrafficByPair, err := latestPersistedContinuityRealTrafficEvidence(now, realTrafficMaxAge)
 	if err != nil {
 		return continuityGroupModelStatusSnapshot{}, err

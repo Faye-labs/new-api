@@ -238,6 +238,51 @@ func latestContinuityRecentRelaySuccess(
 	}, true
 }
 
+func latestContinuityRecentRelayOutcome(
+	groupKey string,
+	modelID string,
+	now time.Time,
+	maxAge time.Duration,
+) (continuityRecentRelayOutcome, bool) {
+	if maxAge <= 0 {
+		return continuityRecentRelayOutcome{}, false
+	}
+	nowUnix := now.UTC().Unix()
+	cutoff := now.UTC().Add(-maxAge).Unix()
+	pairKey := continuityGroupModelProbePairKey(groupKey, modelID)
+	continuityRecentRelaySuccesses.RLock()
+	entry := continuityRecentRelaySuccesses.byPair[pairKey]
+	evidence := continuityRecentRelayOutcome{}
+	if entry != nil {
+		evidence = entry.evidence
+	}
+	continuityRecentRelaySuccesses.RUnlock()
+	bucketStart := cutoff - cutoff%model.ContinuityRelayOutcomeBucketSeconds
+	rows, err := model.GetContinuityRelayOutcomeBucketsForPair(
+		groupKey,
+		modelID,
+		bucketStart,
+		nowUnix,
+	)
+	if err == nil {
+		for _, row := range rows {
+			if row.LatestSuccessAt >= evidence.LatestSuccessAt {
+				evidence.LatestSuccessAt = row.LatestSuccessAt
+				evidence.LatestSuccessLatencyMs = row.LatestSuccessLatencyMs
+			}
+			if row.LatestFailureAt > evidence.LatestFailureAt {
+				evidence.LatestFailureAt = row.LatestFailureAt
+			}
+		}
+	}
+	hasSuccess := evidence.LatestSuccessAt >= cutoff && evidence.LatestSuccessAt <= nowUnix
+	hasFailure := evidence.LatestFailureAt >= cutoff && evidence.LatestFailureAt <= nowUnix
+	if !hasSuccess && !hasFailure {
+		return continuityRecentRelayOutcome{}, false
+	}
+	return evidence, true
+}
+
 func snapshotContinuityRecentRelayOutcomes() map[string]continuityRecentRelayOutcome {
 	continuityRecentRelaySuccesses.RLock()
 	defer continuityRecentRelaySuccesses.RUnlock()
@@ -248,8 +293,8 @@ func snapshotContinuityRecentRelayOutcomes() map[string]continuityRecentRelayOut
 	return snapshot
 }
 
-// continuityRecentRelaySuccess remains the compact evidence shape consumed by
-// the existing active-probe coverage logic.
+// continuityRecentRelaySuccess remains the compact successful-evidence shape
+// consumed by status compatibility fallbacks.
 type continuityRecentRelaySuccess struct {
 	ObservedAt int64
 	LatencyMs  int64
