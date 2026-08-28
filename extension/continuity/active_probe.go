@@ -391,6 +391,9 @@ func loadContinuityGroupModelProbePairs() ([]continuityGroupModelProbePair, erro
 	channelIDs := make([]int, 0, len(abilities))
 	seenChannelIDs := make(map[int]struct{}, len(abilities))
 	for _, ability := range abilities {
+		if !isContinuityGroupModelProbeGroup(ability.Group) {
+			continue
+		}
 		if _, ok := seenChannelIDs[ability.ChannelId]; ok {
 			continue
 		}
@@ -412,6 +415,9 @@ func loadContinuityGroupModelProbePairs() ([]continuityGroupModelProbePair, erro
 
 	pairsByKey := make(map[string]*continuityGroupModelProbePair)
 	for _, ability := range abilities {
+		if !isContinuityGroupModelProbeGroup(ability.Group) {
+			continue
+		}
 		pairKey := continuityGroupModelProbePairKey(ability.Group, ability.Model)
 		if _, excluded := excludedPairs[pairKey]; excluded {
 			continue
@@ -455,6 +461,16 @@ func loadContinuityGroupModelProbePairs() ([]continuityGroupModelProbePair, erro
 		return pairs[i].modelID < pairs[j].modelID
 	})
 	return pairs, nil
+}
+
+func isContinuityGroupModelProbeGroup(groupKey string) bool {
+	family, _, _ := strings.Cut(strings.TrimSpace(groupKey), "-")
+	switch strings.ToLower(family) {
+	case "standard", "surge", "direct", "wild", "spot", "turbo":
+		return true
+	default:
+		return false
+	}
 }
 
 func rotateContinuityGroupModelProbeCandidates(

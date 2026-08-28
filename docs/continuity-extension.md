@@ -154,6 +154,13 @@ with `CONTINUITY_GROUP_MODEL_PROBE_INTERVAL_MINUTES`, or disable scheduled
 checks with `CONTINUITY_GROUP_MODEL_PROBE_ENABLED=0`; manual checks remain
 available while the extension itself is enabled.
 
+Scheduled and manual provider probes are limited to the `standard`, `surge`,
+`direct`, `wild`, `spot`, and `turbo` routing-group families. Matching is
+case-insensitive against the segment before the first `-`, so deployed keys such
+as `Standard-1.2` and `Turbo-2.5` remain eligible when their ratio suffix changes.
+Other groups remain visible through passive user-traffic status but never send
+provider probes.
+
 Scheduled and manual checks use sanitized user traffic as the primary health
 evidence. For each exact group/model pair, all relevant final relay outcomes in
 the fixed preceding five-minute window form one free health sample: success-only

@@ -2,6 +2,7 @@ package continuity
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -612,6 +613,56 @@ func TestContinuityGroupModelProbeExclusionsMatchExactGroupModelPair(t *testing.
 	assert.Equal(t, "shared-model", result.Pairs[0].ModelID)
 }
 
+func TestContinuityGroupModelProbeOnlyCallsApprovedGroupFamilies(t *testing.T) {
+	setupContinuityManagedGroupServiceTest(t)
+	groups := []string{
+		"Standard-1.2",
+		"Surge-2",
+		"Direct-7",
+		"Wild-0.1",
+		"Spot-0.7",
+		"Turbo-2.5",
+		"compress",
+		"fallback",
+		"tool",
+		"standardish-1",
+	}
+	channels := make([]model.Channel, 0, len(groups))
+	abilities := make([]model.Ability, 0, len(groups))
+	for index, group := range groups {
+		channelID := index + 1
+		channels = append(channels, model.Channel{
+			Id:     channelID,
+			Name:   group,
+			Key:    fmt.Sprintf("key-%d", channelID),
+			Status: common.ChannelStatusEnabled,
+		})
+		abilities = append(abilities, model.Ability{
+			Group:     group,
+			Model:     fmt.Sprintf("model-%d", channelID),
+			ChannelId: channelID,
+			Enabled:   true,
+		})
+	}
+	createContinuityProbePair(t, channels, abilities)
+
+	var probedGroups []string
+	installContinuityProbeTestDoubles(t,
+		func(_ context.Context, _ *model.Channel, _ string, groupKey string) controller.ChannelProbeResult {
+			probedGroups = append(probedGroups, groupKey)
+			return controller.ChannelProbeResult{Status: controller.ChannelProbeStatusSucceeded}
+		},
+		func(_ context.Context, _ time.Duration) error { return nil },
+	)
+
+	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, groups[:6], probedGroups)
+	require.Len(t, result.Pairs, 6)
+	assert.Equal(t, 6, result.Summary.Total)
+	assert.Equal(t, 6, result.Summary.ProviderAttempts)
+}
+
 func TestContinuityGroupModelProbeRechecksExclusionsBeforeEveryChannelAttempt(t *testing.T) {
 	setupContinuityManagedGroupServiceTest(t)
 	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"standard":1}`))
@@ -727,8 +778,8 @@ func TestContinuityGroupModelProbeRequiresSecondFullFailureBeforeUnavailable(t *
 			{Id: 2, Name: "second", Key: "key-2", Status: common.ChannelStatusEnabled},
 		},
 		[]model.Ability{
-			{Group: "compress", Model: "model-a", ChannelId: 1, Enabled: true, Priority: &priority},
-			{Group: "compress", Model: "model-a", ChannelId: 2, Enabled: true, Priority: &priority},
+			{Group: "spot", Model: "model-a", ChannelId: 1, Enabled: true, Priority: &priority},
+			{Group: "spot", Model: "model-a", ChannelId: 2, Enabled: true, Priority: &priority},
 		},
 	)
 
@@ -751,7 +802,7 @@ func TestContinuityGroupModelProbeRequiresSecondFullFailureBeforeUnavailable(t *
 	assert.Equal(t, 4, probeCount)
 	assert.Equal(t, 1, waitCount)
 	require.Len(t, result.Pairs, 1)
-	assert.Equal(t, "compress", result.Pairs[0].GroupKey)
+	assert.Equal(t, "spot", result.Pairs[0].GroupKey)
 	assert.Equal(t, continuityModelStatusUnavailable, result.Pairs[0].Status)
 	assert.Equal(t, 1, result.Summary.Unavailable)
 }
@@ -760,7 +811,7 @@ func TestScheduledProbeRechecksTrafficBeforeFailureConfirmation(t *testing.T) {
 	setupContinuityManagedGroupServiceTest(t)
 	createContinuityProbePair(t,
 		[]model.Channel{{Id: 1, Name: "provider", Key: "key-1", Status: common.ChannelStatusEnabled}},
-		[]model.Ability{{Group: "compress", Model: "model-a", ChannelId: 1, Enabled: true}},
+		[]model.Ability{{Group: "spot", Model: "model-a", ChannelId: 1, Enabled: true}},
 	)
 	probeCount := 0
 	waitCount := 0
@@ -772,7 +823,7 @@ func TestScheduledProbeRechecksTrafficBeforeFailureConfirmation(t *testing.T) {
 		func(_ context.Context, _ time.Duration) error {
 			waitCount++
 			recordContinuityRecentRelaySuccess(extension.RelaySuccessEvent{
-				Group:      "compress",
+				Group:      "spot",
 				Model:      "model-a",
 				ObservedAt: continuityProbeNow(),
 				LatencyMs:  80,
