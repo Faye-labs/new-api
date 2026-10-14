@@ -32,7 +32,8 @@ type continuityAccountAPITokenDisableRequest struct {
 }
 
 type continuityGroupModelProbeExclusionsRequest struct {
-	Pairs *[]continuityGroupModelProbeExclusion `json:"pairs"`
+	Pairs            *[]continuityGroupModelProbeExclusion `json:"pairs"`
+	EnabledGroupKeys *[]string                             `json:"enabled_group_keys"`
 }
 
 func capabilitiesHandler(c *gin.Context) {
@@ -273,9 +274,10 @@ func getGroupModelProbeExclusionsHandler(c *gin.Context) {
 		"success": true,
 		"message": "",
 		"data": gin.H{
-			"schema_version": continuityGroupModelProbeExclusionsSchema,
-			"initialized":    state.Initialized,
-			"pairs":          state.Pairs,
+			"schema_version":     continuityGroupModelProbeExclusionsSchema,
+			"initialized":        state.Initialized,
+			"pairs":              state.Pairs,
+			"enabled_group_keys": state.EnabledGroupKeys,
 		},
 	})
 }
@@ -291,20 +293,16 @@ func replaceGroupModelProbeExclusionsHandler(c *gin.Context) {
 		writeInternalError(c, errInvalidRequest)
 		return
 	}
-	pairs, err := replaceContinuityGroupModelProbeExclusions(*request.Pairs)
+	var scopes [][]string
+	if request.EnabledGroupKeys != nil {
+		scopes = append(scopes, *request.EnabledGroupKeys)
+	}
+	_, err := replaceContinuityGroupModelProbeExclusions(*request.Pairs, scopes...)
 	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data": gin.H{
-			"schema_version": continuityGroupModelProbeExclusionsSchema,
-			"initialized":    true,
-			"pairs":          pairs,
-		},
-	})
+	getGroupModelProbeExclusionsHandler(c)
 }
 
 func writeInternalError(c *gin.Context, err error) {

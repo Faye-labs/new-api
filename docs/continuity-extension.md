@@ -154,12 +154,27 @@ with `CONTINUITY_GROUP_MODEL_PROBE_INTERVAL_MINUTES`, or disable scheduled
 checks with `CONTINUITY_GROUP_MODEL_PROBE_ENABLED=0`; manual checks remain
 available while the extension itself is enabled.
 
-Scheduled and manual provider probes are limited to the `standard`, `surge`,
-`direct`, `wild`, `spot`, and `turbo` routing-group families. Matching is
-case-insensitive against the segment before the first `-`, so deployed keys such
-as `Standard-1.2` and `Turbo-2.5` remain eligible when their ratio suffix changes.
-Other groups remain visible through passive user-traffic status but never send
-provider probes.
+Scheduled and manual provider probes use the exact `enabled_group_keys` allowlist
+published by Gateway from Admin routing-group policies with an open entry
+(`create_and_profile` or `profile_only`). Group names and prefixes have no probe
+semantics. New groups are admitted by policy synchronization without code changes.
+The version-1 exclusions contract additively accepts and returns
+`enabled_group_keys`: omitted PUT fields preserve the existing scope; an explicit
+empty array disables every active probe. Older stored policies without this field
+admit no probes until Gateway synchronizes the scope. Scope and pair exclusions
+are stored atomically, and both are rechecked before each channel attempt.
+Gateway verifies the returned scope exactly; an older NewAPI that ignores it
+leaves synchronization pending. Deploy the NewAPI contract before Gateway.
+
+Within one task pass, a channel/model probe is sent only once even if the channel
+belongs to multiple enabled groups. Its synthetic result is reused by those
+pairs, while their individual candidate priorities, fallback channels, exclusions
+and real-traffic evidence remain group-scoped. Different models are tested
+separately. The failure-confirmation pass starts a fresh cache, so shared failures
+receive one actual confirmation rather than reusing the first failure or sending
+one confirmation per group. No synthetic cache survives the task. Attempt counts
+include only actual probe calls; groups served entirely from reused synthetic
+results do not add to the `probed` or `provider_attempts` counters.
 
 Scheduled and manual checks use sanitized user traffic as the primary health
 evidence. For each exact group/model pair, all relevant final relay outcomes in

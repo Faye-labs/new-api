@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,14 @@ func createContinuityProbePair(
 		)
 		require.NoError(t, err)
 	}
+	groups := append([]string{}, state.EnabledGroupKeys...)
+	for _, ability := range abilities {
+		if !slices.Contains(groups, ability.Group) {
+			groups = append(groups, ability.Group)
+		}
+	}
+	_, err = replaceContinuityGroupModelProbeExclusions(state.Pairs, groups)
+	require.NoError(t, err)
 	require.NoError(t, model.DB.Create(&databaseChannels).Error)
 	require.NoError(t, model.DB.Create(&abilities).Error)
 }
@@ -613,7 +622,7 @@ func TestContinuityGroupModelProbeExclusionsMatchExactGroupModelPair(t *testing.
 	assert.Equal(t, "shared-model", result.Pairs[0].ModelID)
 }
 
-func TestContinuityGroupModelProbeOnlyCallsApprovedGroupFamilies(t *testing.T) {
+func TestContinuityGroupModelProbeUsesExplicitScopeIncludingNewGroupNames(t *testing.T) {
 	setupContinuityManagedGroupServiceTest(t)
 	groups := []string{
 		"Standard-1.2",
@@ -625,7 +634,7 @@ func TestContinuityGroupModelProbeOnlyCallsApprovedGroupFamilies(t *testing.T) {
 		"compress",
 		"fallback",
 		"tool",
-		"standardish-1",
+		"future-group",
 	}
 	channels := make([]model.Channel, 0, len(groups))
 	abilities := make([]model.Ability, 0, len(groups))
@@ -645,6 +654,8 @@ func TestContinuityGroupModelProbeOnlyCallsApprovedGroupFamilies(t *testing.T) {
 		})
 	}
 	createContinuityProbePair(t, channels, abilities)
+	_, err := replaceContinuityGroupModelProbeExclusions(nil, []string{"Turbo-2.5", "future-group"})
+	require.NoError(t, err)
 
 	var probedGroups []string
 	installContinuityProbeTestDoubles(t,
@@ -657,10 +668,10 @@ func TestContinuityGroupModelProbeOnlyCallsApprovedGroupFamilies(t *testing.T) {
 
 	result, err := runContinuityGroupModelProbe(context.Background(), nil, nil)
 	require.NoError(t, err)
-	assert.ElementsMatch(t, groups[:6], probedGroups)
-	require.Len(t, result.Pairs, 6)
-	assert.Equal(t, 6, result.Summary.Total)
-	assert.Equal(t, 6, result.Summary.ProviderAttempts)
+	assert.ElementsMatch(t, []string{"Turbo-2.5", "future-group"}, probedGroups)
+	require.Len(t, result.Pairs, 2)
+	assert.Equal(t, 2, result.Summary.Total)
+	assert.Equal(t, 2, result.Summary.ProviderAttempts)
 }
 
 func TestContinuityGroupModelProbeRechecksExclusionsBeforeEveryChannelAttempt(t *testing.T) {

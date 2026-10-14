@@ -2,6 +2,7 @@ package continuity
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -25,13 +26,15 @@ type continuityGroupModelProbeExclusion struct {
 }
 
 type continuityGroupModelProbeExclusions struct {
-	SchemaVersion int                                  `json:"schema_version"`
-	Pairs         []continuityGroupModelProbeExclusion `json:"pairs"`
+	SchemaVersion    int                                  `json:"schema_version"`
+	EnabledGroupKeys []string                             `json:"enabled_group_keys"`
+	Pairs            []continuityGroupModelProbeExclusion `json:"pairs"`
 }
 
 type continuityGroupModelProbeExclusionState struct {
-	Initialized bool
-	Pairs       []continuityGroupModelProbeExclusion
+	Initialized      bool
+	EnabledGroupKeys []string
+	Pairs            []continuityGroupModelProbeExclusion
 }
 
 func canonicalizeContinuityGroupModelProbeExclusions(
@@ -132,13 +135,18 @@ func loadContinuityGroupModelProbeExclusionState() (
 			stored.SchemaVersion,
 		)
 	}
+	groups, err := canonicalizeContinuityProbeGroups(stored.EnabledGroupKeys)
+	if err != nil {
+		return continuityGroupModelProbeExclusionState{}, err
+	}
 	pairs, err := canonicalizeContinuityGroupModelProbeExclusions(stored.Pairs)
 	if err != nil {
 		return continuityGroupModelProbeExclusionState{}, err
 	}
 	return continuityGroupModelProbeExclusionState{
-		Initialized: true,
-		Pairs:       pairs,
+		Initialized:      true,
+		EnabledGroupKeys: groups,
+		Pairs:            pairs,
 	}, nil
 }
 
@@ -155,6 +163,7 @@ func loadContinuityGroupModelProbeExclusions() (
 
 func replaceContinuityGroupModelProbeExclusions(
 	pairs []continuityGroupModelProbeExclusion,
+	enabledGroups ...[]string,
 ) ([]continuityGroupModelProbeExclusion, error) {
 	normalized, err := canonicalizeContinuityGroupModelProbeExclusions(pairs)
 	if err != nil {
@@ -170,9 +179,17 @@ func replaceContinuityGroupModelProbeExclusions(
 	); err != nil {
 		return nil, err
 	}
+	groups := persistedState.EnabledGroupKeys
+	if len(enabledGroups) > 0 {
+		groups, err = canonicalizeContinuityProbeGroups(enabledGroups[0])
+		if err != nil {
+			return nil, err
+		}
+	}
 	encoded, err := common.Marshal(continuityGroupModelProbeExclusions{
-		SchemaVersion: continuityGroupModelProbeExclusionsSchema,
-		Pairs:         normalized,
+		SchemaVersion:    continuityGroupModelProbeExclusionsSchema,
+		EnabledGroupKeys: groups,
+		Pairs:            normalized,
 	})
 	if err != nil {
 		return nil, err
@@ -207,4 +224,24 @@ func continuityGroupModelProbeExclusionSet(
 			struct{}{}
 	}
 	return excluded
+}
+
+// A nil scope is an older/uninitialized policy and admits no active probes.
+// Keys are owned by Gateway policy, not inferred from NewAPI group names.
+func canonicalizeContinuityProbeGroups(groups []string) ([]string, error) {
+	if groups == nil {
+		return nil, nil
+	}
+	normalized := make([]string, 0, len(groups))
+	seen := make(map[string]bool, len(groups))
+	for _, group := range groups {
+		key, err := normalizeContinuityManagedGroup(group)
+		if err != nil || seen[key] {
+			return nil, errInvalidRequest
+		}
+		seen[key] = true
+		normalized = append(normalized, key)
+	}
+	slices.Sort(normalized)
+	return normalized, nil
 }

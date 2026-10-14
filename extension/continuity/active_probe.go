@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -179,6 +180,7 @@ func runContinuityGroupModelProbe(
 	evidenceByPair := make(map[string]continuityGroupModelProbeEvidence, len(pairs))
 	probedPairs := make(map[string]struct{}, len(pairs))
 	providerAttemptsTotal := 0
+	attempts := make(map[continuityChannelProbeKey]continuityChannelProbeObservation)
 	needsConfirmation := make([]continuityGroupModelProbePair, 0)
 	processed := 0
 	total := len(pairs)
@@ -238,6 +240,7 @@ func runContinuityGroupModelProbe(
 			ctx,
 			*pair,
 			trafficCoverageMaxAge,
+			attempts,
 		)
 		if err != nil {
 			return continuityGroupModelProbeResult{}, err
@@ -287,6 +290,8 @@ func runContinuityGroupModelProbe(
 			return continuityGroupModelProbeResult{}, err
 		}
 	}
+	// Confirmation is a fresh pass; never reuse a first-pass failure.
+	clear(attempts)
 	for _, pair := range needsConfirmation {
 		if err := ctx.Err(); err != nil {
 			return continuityGroupModelProbeResult{}, err
@@ -296,6 +301,7 @@ func runContinuityGroupModelProbe(
 			ctx,
 			pair,
 			trafficCoverageMaxAge,
+			attempts,
 		)
 		if err != nil {
 			return continuityGroupModelProbeResult{}, err
@@ -391,7 +397,7 @@ func loadContinuityGroupModelProbePairs() ([]continuityGroupModelProbePair, erro
 	channelIDs := make([]int, 0, len(abilities))
 	seenChannelIDs := make(map[int]struct{}, len(abilities))
 	for _, ability := range abilities {
-		if !isContinuityGroupModelProbeGroup(ability.Group) {
+		if !slices.Contains(exclusionState.EnabledGroupKeys, ability.Group) {
 			continue
 		}
 		if _, ok := seenChannelIDs[ability.ChannelId]; ok {
@@ -415,7 +421,7 @@ func loadContinuityGroupModelProbePairs() ([]continuityGroupModelProbePair, erro
 
 	pairsByKey := make(map[string]*continuityGroupModelProbePair)
 	for _, ability := range abilities {
-		if !isContinuityGroupModelProbeGroup(ability.Group) {
+		if !slices.Contains(exclusionState.EnabledGroupKeys, ability.Group) {
 			continue
 		}
 		pairKey := continuityGroupModelProbePairKey(ability.Group, ability.Model)
@@ -463,16 +469,6 @@ func loadContinuityGroupModelProbePairs() ([]continuityGroupModelProbePair, erro
 	return pairs, nil
 }
 
-func isContinuityGroupModelProbeGroup(groupKey string) bool {
-	family, _, _ := strings.Cut(strings.TrimSpace(groupKey), "-")
-	switch strings.ToLower(family) {
-	case "standard", "surge", "direct", "wild", "spot", "turbo":
-		return true
-	default:
-		return false
-	}
-}
-
 func rotateContinuityGroupModelProbeCandidates(
 	candidates []continuityGroupModelProbeCandidate,
 	rotation int,
@@ -503,6 +499,7 @@ func probeContinuityGroupModelPair(
 	ctx context.Context,
 	pair continuityGroupModelProbePair,
 	trafficCoverageMaxAge time.Duration,
+	attempts map[continuityChannelProbeKey]continuityChannelProbeObservation,
 ) (continuityGroupModelProbeRoundResult, bool, error) {
 	failed := 0
 	uncertain := 0
@@ -533,20 +530,19 @@ func probeContinuityGroupModelPair(
 			traffic.providerAttempts = providerAttempts
 			return traffic, false, nil
 		}
-		attemptContext, cancelAttempt := context.WithTimeout(
-			ctx,
-			continuityGroupModelProbeAttemptTimeout,
-		)
-		result := runContinuityChannelProbe(
-			attemptContext,
-			candidate.channel,
-			pair.modelID,
-			pair.groupKey,
-		)
-		probeAttempted = true
-		providerAttempts++
-		cancelAttempt()
-		checkedAt := continuityProbeNow().UTC().Unix()
+		key := continuityChannelProbeKey{channelID: candidate.channel.Id, modelID: pair.modelID}
+		observation, reused := attempts[key]
+		if !reused {
+			attemptContext, cancelAttempt := context.WithTimeout(ctx, continuityGroupModelProbeAttemptTimeout)
+			result := runContinuityChannelProbe(attemptContext, candidate.channel, pair.modelID, pair.groupKey)
+			cancelAttempt()
+			observation = continuityChannelProbeObservation{result: result, checkedAt: continuityProbeNow().UTC().Unix()}
+			attempts[key] = observation
+			probeAttempted = true
+			providerAttempts++
+		}
+		result := observation.result
+		checkedAt := observation.checkedAt
 		switch result.Status {
 		case controller.ChannelProbeStatusSucceeded:
 			status := continuityModelStatusOperational
@@ -641,7 +637,7 @@ func isContinuityGroupModelProbePairExcluded(groupKey string, modelID string) (b
 	if err != nil {
 		return false, err
 	}
-	if !exclusionState.Initialized {
+	if !exclusionState.Initialized || !slices.Contains(exclusionState.EnabledGroupKeys, groupKey) {
 		return true, nil
 	}
 	pairKey := continuityGroupModelProbePairKey(groupKey, modelID)
@@ -832,4 +828,14 @@ func buildContinuityGroupModelProbeTaskView(
 		}
 	}
 	return view, nil
+}
+
+// Task-local, per-pass evidence only. Real user traffic remains group-scoped.
+type continuityChannelProbeKey struct {
+	channelID int
+	modelID   string
+}
+type continuityChannelProbeObservation struct {
+	result    controller.ChannelProbeResult
+	checkedAt int64
 }
