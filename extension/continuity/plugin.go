@@ -40,6 +40,7 @@ func (plugin) Mount(router *gin.Engine) {
 	internalRoute.Use(middleware.RouteTag("internal"), continuityInternalAuth())
 	{
 		internalRoute.GET("/capabilities", capabilitiesHandler)
+		internalRoute.POST("/model-usage", modelUsageHandler)
 		internalRoute.GET(
 			"/account-api/users/:userId/tokens/:tokenId/requests/:requestId/outcome",
 			accountAPIRequestOutcomeHandler,

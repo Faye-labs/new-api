@@ -236,3 +236,7 @@ Then build the normal NewAPI artifact and probe the deployed capability
 endpoint before enabling Gateway model-brand routing. A compile failure in
 the model adapter or a capability mismatch is an explicit upgrade stop; do
 not bypass it with direct database writes.
+
+### Model request counts (schema version 1)
+
+`POST /internal/continuity/model-usage` is an authenticated read-only request-log projection. Input: `schema_version: 1`, `from` inclusive Unix seconds, `until` exclusive Unix seconds, and 1–1000 positive `token_ids`. The trusted Gateway selects token ownership/classification. NewAPI counts type-2 consumption rows by requested model, including zero-cost consumption records; failures and probes without eligible user tokens are excluded. Output is only `data.schema_version` and `data.models[{model_id,requests}]`. This does not read or mutate billing policy, balances, tokens or logs. Gateway owns the final public model-name projection and must never forward the internal response wholesale.
