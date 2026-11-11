@@ -1,6 +1,7 @@
 package continuity
 
 import (
+	"context"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
@@ -54,4 +55,34 @@ func TestModelUsageIsAuthenticatedScopedAndAllowlisted(t *testing.T) {
 	for _, bad := range []string{`{}`, `{"schema_version":1,"from":200,"until":100,"token_ids":[10]}`, `{"schema_version":1,"from":100,"until":200,"token_ids":[0]}`} {
 		require.Equal(t, http.StatusBadRequest, call("Bearer "+secret, bad).Code)
 	}
+}
+
+func TestModelUsageBatchesDeduplicateAndCancel(t *testing.T) {
+	db := setupAccountAPIOutcomeTest(t)
+	secret := strings.Repeat("s", 32)
+	t.Setenv(ContinuityInternalAPISecretEnv, secret)
+	ids := make([]int, 0)
+	for id := 1; id <= 70; id++ {
+		ids = append(ids, id)
+		require.NoError(t, db.Create(&model.Log{TokenId: id, Type: model.LogTypeConsume, ModelName: "model", CreatedAt: 150}).Error)
+	}
+	ids = append(ids, 1, 33, 70)
+	body, err := common.Marshal(modelUsageRequest{SchemaVersion: 1, From: 100, Until: 200, TokenIDs: ids})
+	require.NoError(t, err)
+	router := gin.New()
+	(plugin{}).Mount(router)
+	req := httptest.NewRequest(http.MethodPost, "/internal/continuity/model-usage", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+secret)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Contains(t, response.Body.String(), `"requests":70`)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req = httptest.NewRequest(http.MethodPost, "/internal/continuity/model-usage", strings.NewReader(string(body))).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+secret)
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	require.NotContains(t, response.Body.String(), "context canceled")
 }

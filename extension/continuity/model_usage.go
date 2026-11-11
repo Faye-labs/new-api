@@ -2,10 +2,13 @@ package continuity
 
 import (
 	"net/http"
+	"sort"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 type modelUsageRequest struct {
@@ -35,13 +38,36 @@ func modelUsageHandler(c *gin.Context) {
 			return
 		}
 	}
-	rows := make([]modelUsageCount, 0)
-	err := model.LOG_DB.Model(&model.Log{}).Select("model_name AS model_id, COUNT(*) AS requests").
-		Where("type = ? AND token_id IN ? AND created_at >= ? AND created_at < ?", model.LogTypeConsume, request.TokenIDs, request.From, request.Until).
-		Group("model_name").Order("model_name ASC").Find(&rows).Error
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "code": "model_usage_unavailable"})
-		return
+	// Short read batches release SQLite rollback-journal locks between queries.
+	// Deduplicate before batching so repeated tokens cannot double-count requests.
+	ids := make([]int, 0, len(request.TokenIDs))
+	seen := make(map[int]bool)
+	for _, id := range request.TokenIDs {
+		if !seen[id] {
+			ids = append(ids, id)
+			seen[id] = true
+		}
 	}
+	counts := make(map[string]int64)
+	for start := 0; start < len(ids); start += 32 {
+		end := min(start+32, len(ids))
+		var batch []modelUsageCount
+		err := model.LOG_DB.WithContext(c.Request.Context()).Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)}).
+			Model(&model.Log{}).Select("model_name AS model_id, COUNT(*) AS requests").
+			Where("type = ? AND token_id IN ? AND created_at >= ? AND created_at < ?", model.LogTypeConsume, ids[start:end], request.From, request.Until).
+			Group("model_name").Find(&batch).Error
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "code": "model_usage_unavailable"})
+			return
+		}
+		for _, row := range batch {
+			counts[row.ModelID] += row.Requests
+		}
+	}
+	rows := make([]modelUsageCount, 0, len(counts))
+	for id, count := range counts {
+		rows = append(rows, modelUsageCount{ModelID: id, Requests: count})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ModelID < rows[j].ModelID })
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"schema_version": 1, "models": rows}})
 }
