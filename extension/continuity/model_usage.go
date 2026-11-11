@@ -38,31 +38,49 @@ func modelUsageHandler(c *gin.Context) {
 			return
 		}
 	}
-	// Short read batches release SQLite rollback-journal locks between queries.
-	// Deduplicate before batching so repeated tokens cannot double-count requests.
-	ids := make([]int, 0, len(request.TokenIDs))
-	seen := make(map[int]bool)
+	// Bound each read by log IDs, not token count: one token can own years of logs.
+	// Do not hold a transaction across pages; live billing writes can proceed between them.
+	selected := make(map[int]bool, len(request.TokenIDs))
 	for _, id := range request.TokenIDs {
-		if !seen[id] {
-			ids = append(ids, id)
-			seen[id] = true
-		}
+		selected[id] = true
+	}
+	query := model.LOG_DB.WithContext(c.Request.Context()).Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)})
+	var bounds struct {
+		First int64
+		Last  int64
+	}
+	err := query.Model(&model.Log{}).Select("COALESCE(MIN(id),0) AS first, COALESCE(MAX(id),0) AS last").
+		Where("type = ? AND created_at >= ? AND created_at < ?", model.LogTypeConsume, request.From, request.Until).Scan(&bounds).Error
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "code": "model_usage_unavailable"})
+		return
 	}
 	counts := make(map[string]int64)
-	for start := 0; start < len(ids); start += 32 {
-		end := min(start+32, len(ids))
-		var batch []modelUsageCount
-		err := model.LOG_DB.WithContext(c.Request.Context()).Session(&gorm.Session{Logger: logger.Default.LogMode(logger.Silent)}).
-			Model(&model.Log{}).Select("model_name AS model_id, COUNT(*) AS requests").
-			Where("type = ? AND token_id IN ? AND created_at >= ? AND created_at < ?", model.LogTypeConsume, ids[start:end], request.From, request.Until).
-			Group("model_name").Find(&batch).Error
+	for first := bounds.First; first > 0 && first <= bounds.Last; {
+		var page []struct {
+			ID        int64
+			Type      int
+			CreatedAt int64
+			TokenID   int
+			ModelName string
+		}
+		// Only the primary-key range participates in this query plan. Filtering below
+		// prevents a secondary-index scan/sort from extending a page's read lock.
+		err := query.Model(&model.Log{}).Select("id, type, created_at, token_id, model_name").
+			Where("id >= ? AND id <= ?", first, bounds.Last).Order("id ASC").Limit(500).Find(&page).Error
 		if err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "code": "model_usage_unavailable"})
 			return
 		}
-		for _, row := range batch {
-			counts[row.ModelID] += row.Requests
+		for _, row := range page {
+			if row.Type == model.LogTypeConsume && selected[row.TokenID] && row.CreatedAt >= request.From && row.CreatedAt < request.Until {
+				counts[row.ModelName]++
+			}
 		}
+		if len(page) == 0 || page[len(page)-1].ID >= bounds.Last {
+			break
+		}
+		first = page[len(page)-1].ID + 1
 	}
 	rows := make([]modelUsageCount, 0, len(counts))
 	for id, count := range counts {

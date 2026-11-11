@@ -62,11 +62,11 @@ func TestModelUsageBatchesDeduplicateAndCancel(t *testing.T) {
 	secret := strings.Repeat("s", 32)
 	t.Setenv(ContinuityInternalAPISecretEnv, secret)
 	ids := make([]int, 0)
-	for id := 1; id <= 70; id++ {
+	for id := 1; id <= 501; id++ {
 		ids = append(ids, id)
-		require.NoError(t, db.Create(&model.Log{TokenId: id, Type: model.LogTypeConsume, ModelName: "model", CreatedAt: 150}).Error)
+		require.NoError(t, db.Create(&model.Log{Id: id * 100, TokenId: id, Type: model.LogTypeConsume, ModelName: "model", CreatedAt: 150}).Error)
 	}
-	ids = append(ids, 1, 33, 70)
+	ids = append(ids, 1, 33, 501)
 	body, err := common.Marshal(modelUsageRequest{SchemaVersion: 1, From: 100, Until: 200, TokenIDs: ids})
 	require.NoError(t, err)
 	router := gin.New()
@@ -76,7 +76,7 @@ func TestModelUsageBatchesDeduplicateAndCancel(t *testing.T) {
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, req)
 	require.Equal(t, http.StatusOK, response.Code)
-	require.Contains(t, response.Body.String(), `"requests":70`)
+	require.Contains(t, response.Body.String(), `"requests":501`)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	req = httptest.NewRequest(http.MethodPost, "/internal/continuity/model-usage", strings.NewReader(string(body))).WithContext(ctx)
